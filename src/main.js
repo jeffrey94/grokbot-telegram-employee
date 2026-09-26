@@ -24,8 +24,14 @@ const bridge = new Bridge({
   defaultAgent: config.defaultAgent,
   mirrorChatId: config.mirrorChatId,
   mirrorUserId: config.mirrorUserId,
+  allowedTopicIds: config.allowedTopicIds,
+  topicNames: config.topicNames,
+  topicAgents: config.topicAgents,
+  groupKeywords: config.groupKeywords,
+  groupHint: config.groupHint,
+  voicePromptHint: config.voicePromptHint,
 });
-const dispatcher = new UpdateDispatcher(bridge);
+const dispatcher = new UpdateDispatcher(bridge, { bundling: config.mediaBundling });
 
 await telegram.setMyCommands([
   { command: "help", description: "Show help" },
@@ -51,13 +57,27 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-console.log("grokbot-telegram-bridge started");
+console.log(
+  `grokbot-telegram-bridge started allowChats=${config.allowedChatIds.size} allowedTopics=${config.allowedTopicIds.size || "all"} groupKeywords=${config.groupKeywords.length} customGroupHint=${config.groupHint ? "yes" : "no"} defaultAgent=${JSON.stringify(config.defaultAgent)} replyTimeoutMs=${config.replyTimeoutMs}`,
+);
+console.log(
+  `topic agents loaded count=${config.topicAgents.length} map=${JSON.stringify(Object.fromEntries(config.topicAgents.map((route) => [route.topic, route.agent])))} learnedTopics=${JSON.stringify(state.listTopicNames())}`,
+);
+console.log(
+  dispatcher.bundlingEnabled
+    ? `media bundling albumDebounceMs=${dispatcher.bundling.albumDebounceMs} burstWindowMs=${dispatcher.bundling.burstWindowMs} maxWaitMs=${dispatcher.bundling.maxWaitMs} maxItems=${dispatcher.bundling.maxItems}`
+    : "media bundling disabled",
+);
 const mirrorTask = bridge.runDesktopMirror({ signal: shutdown.signal }).catch((error) => {
   if (!stopping && error.name !== "AbortError") console.error("Desktop mirror stopped:", error.message);
 });
 let consecutiveFailures = 0;
-let fetchOffset = state.offset;
 const pendingCommits = [];
+const inFlightUpdateIds = new Set();
+// Once an update_id is accepted for dispatch in this process, never schedule it
+// again — closes the race where getUpdates(oldOffset) returns a just-finished
+// update after inFlight was cleared but before / while offset commit settles.
+const seenUpdateIds = new Set();
 let commitQueue = Promise.resolve();
 
 function markProcessed(record) {
@@ -71,21 +91,52 @@ function markProcessed(record) {
   return commitQueue;
 }
 
+function isShutdownAbort(_error) {
+  // Request timeouts use AbortSignal.timeout() / AbortSignal.any([...]), so they
+  // also surface as AbortError. Only withhold the Telegram ACK when *shutdown*
+  // aborted the work — otherwise the ordered commit queue wedges forever.
+  return stopping || shutdown.signal.aborted;
+}
+
 while (!stopping) {
   try {
-    const updates = await telegram.getUpdates(fetchOffset, 30, { signal: shutdown.signal });
+    // Poll from the last *committed* offset only. Advancing the Telegram
+    // getUpdates offset before handleUpdate/waitForOwnedReply finishes ACKs
+    // updates that a per-chat queue may still be blocked on; a restart then
+    // loses them (empty getUpdates, state.offset unchanged).
+    const pollOffset = state.offset;
+    const updates = await telegram.getUpdates(pollOffset, 30, { signal: shutdown.signal });
+    let scheduled = 0;
     for (const update of updates) {
-      const record = { offset: update.update_id + 1, processed: false };
+      if (inFlightUpdateIds.has(update.update_id) || seenUpdateIds.has(update.update_id)) continue;
+      inFlightUpdateIds.add(update.update_id);
+      seenUpdateIds.add(update.update_id);
+      if (seenUpdateIds.size > 2_000) {
+        const oldest = seenUpdateIds.values().next().value;
+        seenUpdateIds.delete(oldest);
+      }
+      const record = { offset: update.update_id + 1, processed: false, updateId: update.update_id };
       pendingCommits.push(record);
-      fetchOffset = record.offset;
+      scheduled += 1;
       void dispatcher.dispatch(update, { signal: shutdown.signal }).then(
         () => markProcessed(record),
         (error) => {
-          if (!stopping && error.name !== "AbortError") {
-            console.error("Update dispatch failed:", error.message);
+          if (isShutdownAbort(error)) {
+            // Leave uncommitted so a restart can reclaim still-pending Telegram updates.
+            return;
           }
+          console.error("Update dispatch failed:", error.message);
+          // Commit past failures (incl. HTTP/request AbortError timeouts) so the
+          // poll offset can advance and the chat queue cannot wedge forever.
+          return markProcessed(record);
         },
-      ).catch((error) => console.error("State commit failed:", error.message));
+      ).finally(() => {
+        inFlightUpdateIds.delete(update.update_id);
+      }).catch((error) => console.error("State commit failed:", error.message));
+    }
+    if (updates.length > 0 && scheduled === 0) {
+      // Long-poll returned only in-flight updates; brief pause avoids a spin.
+      await sleep(500, undefined, { signal: shutdown.signal });
     }
     consecutiveFailures = 0;
   } catch (error) {
