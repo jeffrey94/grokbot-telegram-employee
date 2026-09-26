@@ -57,7 +57,32 @@ start() {
     exit 1
   fi
   cd "$BRIDGE_HOME"
-  nohup node --env-file="$ENV_FILE" src/main.js >>"$LOG_FILE" 2>&1 &
+  # Node --env-file does not override existing process env. Clear bridge keys so
+  # .env wins (e.g. inherited TELEGRAM_ALLOWED_CHAT_IDS must not drop forum IDs).
+  env -u TELEGRAM_BOT_TOKEN \
+      -u TELEGRAM_ALLOWED_USER_IDS \
+      -u TELEGRAM_ALLOWED_CHAT_IDS \
+      -u TELEGRAM_ALLOWED_TOPIC_IDS \
+      -u TELEGRAM_TOPIC_NAMES \
+      -u TELEGRAM_TOPIC_AGENTS \
+      -u TELEGRAM_GROUP_KEYWORDS \
+      -u TELEGRAM_GROUP_HINT \
+      -u TELEGRAM_VOICE_PROMPT_HINT \
+      -u TELEGRAM_MEDIA_BUNDLING \
+      -u TELEGRAM_BUNDLE_ALBUM_DEBOUNCE_MS \
+      -u TELEGRAM_BUNDLE_BURST_WINDOW_MS \
+      -u TELEGRAM_BUNDLE_MAX_WAIT_MS \
+      -u TELEGRAM_BUNDLE_MAX_ITEMS \
+      -u GROK_GATEWAY_URL \
+      -u GROK_GATEWAY_TOKEN \
+      -u GROK_GATEWAY_TOKEN_FILE \
+      -u GROK_DEFAULT_AGENT \
+      -u BRIDGE_STATE_PATH \
+      -u GROK_REPLY_TIMEOUT_MS \
+      -u GROK_POLL_INTERVAL_MS \
+      -u GROK_DESKTOP_MIRROR_CHAT_ID \
+      -u GROK_DESKTOP_MIRROR_USER_ID \
+      nohup node --env-file="$ENV_FILE" src/main.js >>"$LOG_FILE" 2>&1 &
   pid=$!
   printf '%s\n' "$pid" >"$PID_FILE"
   sleep 1
