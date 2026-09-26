@@ -11,7 +11,7 @@
 </div>
 
 > [!NOTE]
-> **This is a fork** of [SSBrouhard/grokbot-telegram-bridge](https://github.com/SSBrouhard/grokbot-telegram-bridge), created by the **grokbot-telegram-bridge contributors** (see [LICENSE](LICENSE)) and maintained upstream by [@SSBrouhard](https://github.com/SSBrouhard). Many thanks to the original author for a careful, security-first bridge that made this work possible. The fork keeps the upstream MIT license and copyright notice unchanged. See [What this fork adds](#what-this-fork-adds) and [Fork configuration](#fork-configuration). To install the fork, clone this repository instead of the upstream URL shown under [Install](#install).
+> **This is a fork** of [SSBrouhard/grokbot-telegram-bridge](https://github.com/SSBrouhard/grokbot-telegram-bridge), created by the **grokbot-telegram-bridge contributors** (see [LICENSE](LICENSE)) and maintained upstream by [@SSBrouhard](https://github.com/SSBrouhard). Many thanks to the original author for a careful, security-first bridge that made this work possible. The fork keeps the upstream MIT license and copyright notice unchanged. See [What this fork adds](#what-this-fork-adds) and [Fork configuration](#fork-configuration). To install the fork, follow [Install](#install), which clones this repository (`jeffrey94/grokbot-telegram-employee`) rather than upstream.
 
 > [!IMPORTANT]
 > **Unofficial project.** This bridge is not affiliated with, endorsed by, or supported by xAI, Grok, or Telegram.
@@ -96,7 +96,7 @@ This project does not run Grok for you. If the desktop agent and local gateway a
 Copy the project onto the Grok computer's persistent volume. The control script defaults to `/home/box/grokbot-telegram-bridge`; for an existing installation elsewhere, export `BRIDGE_HOME` instead of moving files.
 
 ```sh
-git clone https://github.com/ssbrouhard/grokbot-telegram-bridge.git /home/box/grokbot-telegram-bridge
+git clone https://github.com/jeffrey94/grokbot-telegram-employee.git /home/box/grokbot-telegram-bridge
 cd /home/box/grokbot-telegram-bridge
 cp .env.example .env
 chmod 600 .env
