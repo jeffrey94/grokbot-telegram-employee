@@ -4,7 +4,6 @@
 
 **A self-hosted Telegram gateway for [Grok Bot](https://grok.com)'s remote computer**
 
-[![CI](https://github.com/SSBrouhard/grokbot-telegram-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/SSBrouhard/grokbot-telegram-bridge/actions/workflows/ci.yml)
 [![Node.js 20.6+](https://img.shields.io/badge/Node.js-20.6%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 

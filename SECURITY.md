@@ -8,7 +8,7 @@ This repository is a fork of [SSBrouhard/grokbot-telegram-bridge](https://github
 
 If you find a security issue, do **not** open a public GitHub issue.
 
-- Prefer [GitHub Security Advisories](https://github.com/ssbrouhard/grokbot-telegram-bridge/security/advisories/new).
+- Prefer this fork's [GitHub Security Advisories](https://github.com/jeffrey94/grokbot-telegram-employee/security/advisories/new). For issues in upstream code, use [upstream's advisories page](https://github.com/ssbrouhard/grokbot-telegram-bridge/security/advisories/new) instead.
 - Include the affected version or commit, reproduction steps, and impact.
 - Do not attach `.env` files, bot tokens, gateway tokens, state files, or logs that may contain chat IDs.
 
