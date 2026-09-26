@@ -82,8 +82,23 @@ function mirrorHarness(options = {}) {
     async setApproval(token, approval) { this.approvals.set(token, { ...approval }); },
     async deleteApproval(token) { this.approvals.delete(token); },
     getDeliveryProgress(key) { return this.deliveries.get(key); },
+    claimDeliveryProgress(key) {
+      const existing = this.deliveries.get(key);
+      if (existing?.completed) return { progress: existing, completed: true, isNewClaim: false };
+      if (existing) return { progress: existing, completed: false, isNewClaim: false };
+      const progress = { nextPart: 0, claimed: true, completed: false };
+      this.deliveries.set(key, progress);
+      return { progress, completed: false, isNewClaim: true };
+    },
     async setDeliveryProgress(key, progress) { this.deliveries.set(key, { ...progress }); },
+    async completeDeliveryProgress(key, progress = {}) {
+      const current = this.deliveries.get(key) ?? {};
+      this.deliveries.set(key, { ...current, ...progress, claimed: true, completed: true });
+    },
     async deleteDeliveryProgress(key) { this.deliveries.delete(key); },
+    isPromptTurnRetired(agentId, clientNonce) {
+      return this.retiredPromptTurns.has(`${agentId}:${clientNonce}`);
+    },
   };
   const telegram = {
     splitMessage(text) { return text.length > 4_096 ? text.match(/[\s\S]{1,4000}/g) : [text]; },
@@ -1158,11 +1173,34 @@ test("serializes prompt delivery between Telegram handling and mirror polling", 
   assert.equal(harness.state.getMirrorCursor("chief").entryId, "telegram-reply");
 });
 
-test("routes ambiguous prompt output only to the configured mirror", async () => {
+test("telegram-originated ambiguous prompt output delivers to the originating chat", async () => {
   const harness = mirrorHarness();
   const clientNonce = "telegram:2:88:20";
   harness.state.promptContexts.set(`chief:${clientNonce}`, {
     origin: "telegram",
+    clientNonce,
+    chatId: 88,
+    replyToMessageId: 20,
+  });
+  harness.transcripts.get("chief").push(
+    { id: "other-chat-prompt", kind: "message", clientNonce, message: { type: "text", content: "Question" } },
+    { id: "ambiguous-update", kind: "send-message", message: { type: "text", content: "Private update" } },
+  );
+
+  await harness.bridge.pollDesktopMirrorOnce();
+
+  assert.equal(harness.sent.length, 1);
+  assert.equal(harness.sent[0].chatId, 88);
+  assert.equal(harness.sent[0].text, "Private update");
+  assert.equal(harness.sent[0].options.replyToMessageId, 20);
+});
+
+test("non-telegram ambiguous prompt output still routes to the configured mirror", async () => {
+  const harness = mirrorHarness();
+  const clientNonce = "desktop:ambiguous:20";
+  harness.state.promptContexts.set(`chief:${clientNonce}`, {
+    origin: "desktop",
+    clientNonce,
     chatId: 88,
     replyToMessageId: 20,
   });
@@ -1177,4 +1215,53 @@ test("routes ambiguous prompt output only to the configured mirror", async () =>
   assert.equal(harness.sent[0].chatId, 99);
   assert.match(harness.sent[0].text, /^Grok update/);
   assert.equal(harness.sent[0].options.replyToMessageId, undefined);
+});
+
+test("one inbound Telegram update delivers the Worker reply only once (deliveryKey idempotent)", async () => {
+  const harness = mirrorHarness({ configured: false });
+  const replyText = "Worker reply body that must not duplicate.";
+  harness.grok.sendPrompt = async (_agentId, _text, clientNonce) => {
+    harness.transcripts.get("chief").push(
+      { id: "telegram-prompt", kind: "message", clientNonce, message: { type: "text", content: "ping" } },
+      { id: "telegram-reply", kind: "send-message", message: { type: "text", content: replyText } },
+    );
+  };
+  harness.grok.waitForReply = async () => ({
+    messageId: "telegram-reply",
+    text: replyText,
+    attachments: [],
+  });
+
+  const update = command("ping");
+  update.update_id = 4242;
+  update.message.message_id = 77;
+
+  await harness.bridge.handleUpdate(update);
+  assert.equal(harness.sent.filter(({ text }) => text === replyText).length, 1);
+
+  // Simulate poll ACK re-dispatch of the same update_id after inFlight cleared.
+  await harness.bridge.handleUpdate(update);
+  assert.equal(
+    harness.sent.filter(({ text }) => text === replyText).length,
+    1,
+    "re-dispatched update must not send the same Worker reply again",
+  );
+
+  const deliveryKey = "prompt:chief:telegram-prompt:telegram-reply";
+  await Promise.all([
+    harness.bridge.deliverTelegramParts({
+      deliveryKey,
+      chatId: 99,
+      agentId: "chief",
+      text: replyText,
+    }),
+    harness.bridge.deliverTelegramParts({
+      deliveryKey,
+      chatId: 99,
+      agentId: "chief",
+      text: replyText,
+    }),
+  ]);
+  assert.equal(harness.sent.filter(({ text }) => text === replyText).length, 1);
+  assert.equal(harness.state.getDeliveryProgress(deliveryKey)?.completed, true);
 });
