@@ -135,3 +135,17 @@ test("refuses a symlinked state file", async () => {
 
   await assert.rejects(new JsonStateStore(filename).load());
 });
+
+test("persists learned forum topic names per chat", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "grok-bridge-topics-"));
+  const filename = path.join(directory, "state.json");
+  const store = new JsonStateStore(filename);
+  await store.load();
+  assert.equal(await store.setTopicName(-1001, 900, "Site Logs"), true);
+  assert.equal(await store.setTopicName(-1001, 900, "Site Logs"), false);
+  const reloaded = new JsonStateStore(filename);
+  await reloaded.load();
+  assert.equal(reloaded.getTopicName(-1001, 900), "Site Logs");
+  assert.deepEqual(reloaded.listTopicNames(), { "-1001": { 900: "Site Logs" } });
+  assert.equal((await stat(filename)).mode & 0o777, 0o600);
+});

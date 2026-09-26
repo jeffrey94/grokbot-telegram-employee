@@ -33,8 +33,14 @@ export class TelegramClient {
     }
     const payload = await response.json();
     if (!payload.ok) {
-      const error = new Error(`Telegram ${method} rejected the request`);
+      const description = typeof payload.description === "string" ? payload.description.trim() : "";
+      const error = new Error(
+        description
+          ? `Telegram ${method} rejected the request: ${description}`
+          : `Telegram ${method} rejected the request`,
+      );
       error.telegramRejected = true;
+      error.telegramDescription = description || undefined;
       throw error;
     }
     return payload.result;
@@ -42,6 +48,20 @@ export class TelegramClient {
 
   splitMessage(text, limit = 4_000) {
     return chunks(text, limit);
+  }
+
+
+  // Telegram forum General topic uses thread id 1. sendMessage/sendMedia with
+  // message_thread_id=1 is rejected ("message thread not found"); omit it and
+  // Telegram routes to General. sendChatAction still needs thread id 1 for typing.
+  threadParams(options = {}, { includeGeneral = false } = {}) {
+    if (!Number.isSafeInteger(options.messageThreadId)) return {};
+    if (!includeGeneral && options.messageThreadId === 1) return {};
+    return { message_thread_id: options.messageThreadId };
+  }
+
+  getMe(options = {}) {
+    return this.call("getMe", {}, 35_000, options);
   }
 
   getUpdates(offset, timeoutSeconds = 30, options = {}) {
@@ -71,17 +91,19 @@ export class TelegramClient {
     const replyMarkup = options.inlineKeyboard
       ? { reply_markup: { inline_keyboard: options.inlineKeyboard } }
       : {};
+    const thread = this.threadParams(options);
     try {
       return await this.call("sendMessage", {
         chat_id: chatId,
         text: markdownToTelegramHtml(text),
         parse_mode: "HTML",
+        ...thread,
         ...reply,
         ...replyMarkup,
       }, 35_000, options);
     } catch (error) {
       if (!error.telegramRejected) throw error;
-      return this.call("sendMessage", { chat_id: chatId, text, ...reply, ...replyMarkup }, 35_000, options);
+      return this.call("sendMessage", { chat_id: chatId, text, ...thread, ...reply, ...replyMarkup }, 35_000, options);
     }
   }
 
@@ -97,11 +119,17 @@ export class TelegramClient {
       chat_id: chatId,
       message_id: messageId,
       reply_markup: { inline_keyboard: inlineKeyboard },
+      ...this.threadParams(options),
     }, 35_000, options);
   }
 
   sendChatAction(chatId, action = "typing", options = {}) {
-    return this.call("sendChatAction", { chat_id: chatId, action }, 35_000, options);
+    return this.call(
+      "sendChatAction",
+      { chat_id: chatId, action, ...this.threadParams(options, { includeGeneral: true }) },
+      35_000,
+      options,
+    );
   }
 
   setMessageReaction(chatId, messageId, emoji, options = {}) {
@@ -109,6 +137,7 @@ export class TelegramClient {
       chat_id: chatId,
       message_id: messageId,
       reaction: [{ type: "emoji", emoji }],
+      ...this.threadParams(options),
     }, 35_000, options);
   }
 
@@ -164,6 +193,10 @@ export class TelegramClient {
         message_id: options.replyToMessageId,
         allow_sending_without_reply: true,
       }));
+    }
+    const thread = this.threadParams(options);
+    if (thread.message_thread_id !== undefined) {
+      form.set("message_thread_id", String(thread.message_thread_id));
     }
     const timeout = AbortSignal.timeout(60_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;

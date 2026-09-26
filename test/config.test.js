@@ -97,3 +97,82 @@ test("rejects malformed allowlist IDs", () => {
     /numeric/,
   );
 });
+
+
+test("parses optional topic allowlist and topic name map", () => {
+  const empty = loadConfig(valid);
+  assert.deepEqual(empty.allowedTopicIds, new Set());
+  assert.deepEqual(empty.topicNames, new Map());
+
+  const config = loadConfig({
+    ...valid,
+    TELEGRAM_ALLOWED_TOPIC_IDS: "111, 1",
+    TELEGRAM_TOPIC_NAMES: '{"111":"Support Desk","1":"General"}',
+  });
+  assert.deepEqual(config.allowedTopicIds, new Set([111, 1]));
+  assert.deepEqual(config.topicNames, new Map([
+    [111, "Support Desk"],
+    [1, "General"],
+  ]));
+
+  const quoted = loadConfig({
+    ...valid,
+    TELEGRAM_TOPIC_NAMES: "'{\"111\":\"Support Desk\"}'",
+  });
+  assert.deepEqual(quoted.topicNames, new Map([[111, "Support Desk"]]));
+
+  assert.throws(
+    () => loadConfig({ ...valid, TELEGRAM_ALLOWED_TOPIC_IDS: "111,nope" }),
+    /numeric/,
+  );
+  assert.throws(
+    () => loadConfig({ ...valid, TELEGRAM_TOPIC_NAMES: "not-json" }),
+    /JSON object/,
+  );
+});
+
+test("parses TELEGRAM_TOPIC_AGENTS name and id routes", () => {
+  const config = loadConfig({ ...valid, TELEGRAM_TOPIC_AGENTS: '"Site Logs=agent-a, 701=Some Agent"' });
+  assert.deepEqual(config.topicAgents, [
+    { topic: "Site Logs", topicName: "site logs", agent: "agent-a" },
+    { topic: "701", topicId: 701, agent: "Some Agent" },
+  ]);
+  assert.deepEqual(loadConfig(valid).topicAgents, []);
+  assert.throws(() => loadConfig({ ...valid, TELEGRAM_TOPIC_AGENTS: "Site Logs" }), /TELEGRAM_TOPIC_AGENTS/);
+});
+
+test("parses group keyword, hint, and voice hint options with neutral defaults", () => {
+  const defaults = loadConfig(valid);
+  assert.deepEqual(defaults.groupKeywords, []);
+  assert.equal(defaults.groupHint, undefined);
+  assert.equal(defaults.voicePromptHint, undefined);
+
+  const config = loadConfig({
+    ...valid,
+    TELEGRAM_GROUP_KEYWORDS: '"Ticket, help desk , 工单,,ticket"',
+    TELEGRAM_GROUP_HINT: "'Reply only to support requests.'",
+    TELEGRAM_VOICE_PROMPT_HINT: "Use the local whisper CLI.",
+  });
+  assert.deepEqual(config.groupKeywords, ["ticket", "help desk", "工单"]);
+  assert.equal(config.groupHint, "Reply only to support requests.");
+  assert.equal(config.voicePromptHint, "Use the local whisper CLI.");
+});
+
+test("parses media bundling switches and timings", () => {
+  assert.deepEqual(loadConfig(valid).mediaBundling, {
+    albumDebounceMs: 1_800,
+    burstWindowMs: 3_000,
+    maxWaitMs: 8_000,
+    maxItems: 10,
+  });
+  assert.deepEqual(loadConfig({
+    ...valid,
+    TELEGRAM_BUNDLE_ALBUM_DEBOUNCE_MS: "1000",
+    TELEGRAM_BUNDLE_BURST_WINDOW_MS: "2000",
+    TELEGRAM_BUNDLE_MAX_WAIT_MS: "5000",
+    TELEGRAM_BUNDLE_MAX_ITEMS: "6",
+  }).mediaBundling, { albumDebounceMs: 1000, burstWindowMs: 2000, maxWaitMs: 5000, maxItems: 6 });
+  assert.equal(loadConfig({ ...valid, TELEGRAM_MEDIA_BUNDLING: "off" }).mediaBundling, false);
+  assert.throws(() => loadConfig({ ...valid, TELEGRAM_MEDIA_BUNDLING: "maybe" }), /TELEGRAM_MEDIA_BUNDLING/);
+  assert.throws(() => loadConfig({ ...valid, TELEGRAM_BUNDLE_MAX_ITEMS: "0" }), /positive integer/);
+});

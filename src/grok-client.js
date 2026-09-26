@@ -306,6 +306,19 @@ export class GrokClient {
     return completedReplyIndex >= 0 ? replyEntries.slice(0, completedReplyIndex + 1) : replyEntries;
   }
 
+  isTelegramOriginWait(clientNonce, options = {}) {
+    if (options?.origin === "telegram") return true;
+    return typeof clientNonce === "string" && clientNonce.startsWith("telegram:");
+  }
+
+  finalizeWaitReplyEntries(replyEntries, completionCandidateId, telegramOrigin) {
+    // Telegram-originated waits keep the full turn; desktop/mirror still truncates
+    // to the frozen busy-era completion candidate so later scheduled output is not absorbed.
+    return telegramOrigin
+      ? replyEntries
+      : this.ownedReplyEntries(replyEntries, completionCandidateId);
+  }
+
   async waitForReply(agentId, clientNonce, options = {}) {
     const deadline = Date.now() + this.replyTimeoutMs;
     let retryDelayMs = this.pollIntervalMs;
@@ -316,6 +329,10 @@ export class GrokClient {
     let stableReplySignature;
     let stableReplySince;
     const announcedApprovals = new Set();
+    const telegramOrigin = this.isTelegramOriginWait(clientNonce, options);
+    const stableReplyMs = Number.isFinite(options.stableReplyMs)
+      ? Math.max(0, options.stableReplyMs)
+      : Math.max(5_000, this.pollIntervalMs * 2);
     while (Date.now() < deadline) {
       options.signal?.throwIfAborted();
       try {
@@ -369,19 +386,24 @@ export class GrokClient {
               stableReplySince = undefined;
               // Freeze the live completion witness only while the agent is busy.
               // Never treat the later current lastMessageId as reply ownership.
+              // Telegram waits ignore this freeze when finalizing (full turn).
               if (typeof agent?.lastMessageId === "string"
                 && replyEntries.some((entry) => entry?.id === agent.lastMessageId)) {
                 completionCandidateId = agent.lastMessageId;
               }
-            } else if (busyReplyObserved) {
+            } else if (busyReplyObserved && !telegramOrigin) {
               return this.replyResult(this.ownedReplyEntries(replyEntries, completionCandidateId));
             } else {
+              // Idle (and telegram after busy→idle): require a short stable window, then
+              // return the full turn for telegram or the owned slice for desktop/mirror.
               const signature = replyEntries.map((entry, index) => entry?.id ?? `entry-${index}`).join(":");
               if (signature !== stableReplySignature) {
                 stableReplySignature = signature;
                 stableReplySince = Date.now();
-              } else if (Date.now() - stableReplySince >= Math.max(5_000, this.pollIntervalMs * 2)) {
-                return this.replyResult(this.ownedReplyEntries(replyEntries, completionCandidateId));
+              } else if (Date.now() - stableReplySince >= stableReplyMs) {
+                return this.replyResult(
+                  this.finalizeWaitReplyEntries(replyEntries, completionCandidateId, telegramOrigin),
+                );
               }
             }
           }
@@ -392,12 +414,22 @@ export class GrokClient {
             const busy = agent?.isRunning === true || agent?.isComposingMessage === true;
             if (busy) {
               busyReplyObserved = true;
+              stableReplySignature = undefined;
+              stableReplySince = undefined;
               if (typeof agent?.lastMessageId === "string"
                 && replyEntries.some((entry) => entry?.id === agent.lastMessageId)) {
                 completionCandidateId = agent.lastMessageId;
               }
-            } else if (busyReplyObserved) {
+            } else if (busyReplyObserved && !telegramOrigin) {
               return this.replyResult(this.ownedReplyEntries(replyEntries, completionCandidateId));
+            } else if (telegramOrigin) {
+              const signature = replyEntries.map((entry, index) => entry?.id ?? `entry-${index}`).join(":");
+              if (signature !== stableReplySignature) {
+                stableReplySignature = signature;
+                stableReplySince = Date.now();
+              } else if (Date.now() - stableReplySince >= stableReplyMs) {
+                return this.replyResult(replyEntries);
+              }
             }
           }
         }
