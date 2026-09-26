@@ -54,3 +54,42 @@ test("splits long replies within Telegram's text limit", async () => {
   assert.deepEqual(bodies.map((body) => body.text.length), [4_000, 4_000, 1]);
   assert.ok(bodies.every((body) => body.chat_id === 99));
 });
+
+
+test("sendMessage forwards message_thread_id for forum topics", async () => {
+  const requests = [];
+  const client = new TelegramClient("token", {
+    fetchImpl: async (url, options) => {
+      requests.push({ method: url.split("/").at(-1), body: JSON.parse(options.body) });
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 1 } }) };
+    },
+  });
+  await client.sendMessage(-1001, "hi", { messageThreadId: 42, replyToMessageId: 7 });
+  assert.equal(requests[0].body.message_thread_id, 42);
+  assert.equal(requests[0].body.reply_parameters.message_id, 7);
+});
+
+
+test("sendMessage omits message_thread_id for forum General topic (thread 1)", async () => {
+  const requests = [];
+  const client = new TelegramClient("token", {
+    fetchImpl: async (url, options) => {
+      requests.push({ method: url.split("/").at(-1), body: JSON.parse(options.body) });
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 1 } }) };
+    },
+  });
+  await client.sendMessage(-1001, "hi", { messageThreadId: 1 });
+  assert.equal("message_thread_id" in requests[0].body, false);
+});
+
+test("sendChatAction keeps message_thread_id for forum General topic (thread 1)", async () => {
+  const requests = [];
+  const client = new TelegramClient("token", {
+    fetchImpl: async (url, options) => {
+      requests.push({ method: url.split("/").at(-1), body: JSON.parse(options.body) });
+      return { ok: true, json: async () => ({ ok: true, result: true }) };
+    },
+  });
+  await client.sendChatAction(-1001, "typing", { messageThreadId: 1 });
+  assert.equal(requests[0].body.message_thread_id, 1);
+});

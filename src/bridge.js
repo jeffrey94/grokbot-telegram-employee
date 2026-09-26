@@ -23,12 +23,274 @@ const HELP = [
   "Telegram-safe routine choice cards are one-time actions and expire in 12 hours.",
 ].join("\n");
 
+/**
+ * Optional group fast-path keywords (TELEGRAM_GROUP_KEYWORDS). A group message
+ * whose text/caption contains one of these is forwarded without the soft-forward
+ * hint, like a mention. Empty by default: only mentions, slash commands and
+ * replies to the bot take the fast path.
+ */
+export const DEFAULT_GROUP_KEYWORDS = Object.freeze([]);
+
+/** Normalized exact-match group chatter that should not wake the bot. */
+export const GROUP_NOISE_EXACT = Object.freeze(new Set([
+  "ok",
+  "okay",
+  "okok",
+  "kk",
+  "k",
+  "lol",
+  "lmao",
+  "haha",
+  "hahaha",
+  "hehe",
+  "hihi",
+  "哈哈",
+  "哈哈哈",
+  "呵呵",
+  "嗯",
+  "哦",
+  "喔",
+  "好",
+  "好的",
+  "好滴",
+  "收到",
+  "谢谢",
+  "多谢",
+  "thx",
+  "thanks",
+  "thank you",
+  "ty",
+  "np",
+  "cool",
+  "nice",
+  "yep",
+  "yup",
+  "yeah",
+  "yes",
+  "no",
+  "nope",
+  "👍",
+  "😂",
+  "🙏",
+  "👀",
+  "😊",
+  "😄",
+  "✅",
+  "👌",
+  "❤️",
+  "💯",
+]));
+
+/** Sentinel reply texts: intentional Telegram silence (exact trim match). */
+export const TELEGRAM_NO_REPLY_SENTINELS = Object.freeze(new Set([
+  "NO_TELEGRAM_REPLY",
+  "[NO_TELEGRAM_REPLY]",
+  "⟦noreply⟧",
+]));
+
+const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF\u2060]/g;
+const LETTER_DIGIT_CJK_RE = /[0-9A-Za-z\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
+
+/** Trim, lower-case, strip zero-width characters. */
+export function normalizeGroupNoiseText(text) {
+  if (typeof text !== "string") return "";
+  return text.replace(ZERO_WIDTH_RE, "").trim().toLocaleLowerCase();
+}
+
+/** True for exact ack/emoji noise or short punctuation/emoji-only chatter. */
+export function isGroupNoiseText(text) {
+  const normalized = normalizeGroupNoiseText(text);
+  if (!normalized) return true;
+  if (GROUP_NOISE_EXACT.has(normalized)) return true;
+  // Pure emoji / punctuation-only (≤6 chars, no letters/digits/CJK).
+  if (normalized.length <= 6 && !LETTER_DIGIT_CJK_RE.test(normalized)) return true;
+  return false;
+}
+
+/**
+ * True for stickers/animations without usable caption, or service/empty
+ * chatter. False when photo/document/video/voice/audio/video_note (caption
+ * optional), or text itself is not noise — voice notes are soft-forwarded.
+ */
+export function isGroupNoiseMessage(message) {
+  if (!message || typeof message !== "object") return true;
+  const text = typeof message.text === "string" ? message.text
+    : typeof message.caption === "string" ? message.caption
+      : "";
+  const trimmed = text.trim();
+  const hasMeaningfulText = trimmed.length >= 2 && !isGroupNoiseText(trimmed);
+
+  // Service / membership noise
+  if (message.new_chat_members || message.left_chat_member || message.new_chat_title
+    || message.new_chat_photo || message.delete_chat_photo || message.group_chat_created
+    || message.supergroup_chat_created || message.migrate_to_chat_id || message.migrate_from_chat_id
+    || message.pinned_message || message.message_auto_delete_timer_changed) {
+    return true;
+  }
+
+  if (message.sticker || message.animation) {
+    return !hasMeaningfulText;
+  }
+  if (message.voice || message.video_note || message.audio
+    || message.photo || message.document || message.video) {
+    // Media with any caption that is not noise, or meaningful text → not noise.
+    if (hasMeaningfulText) return false;
+    if (trimmed && !isGroupNoiseText(trimmed)) return false;
+    // Captionless media still soft-forwards (photo, scan, voice memo).
+    return false;
+  }
+  if (!trimmed) return true;
+  return isGroupNoiseText(trimmed);
+}
+
+/** True when agent reply is intentional Telegram silence (no attachments). */
+export function isSilentTelegramReply(text, attachments = []) {
+  if (Array.isArray(attachments) && attachments.length > 0) return false;
+  if (typeof text !== "string") return false;
+  return TELEGRAM_NO_REPLY_SENTINELS.has(text.trim());
+}
+
+/** True when a prompt context / nonce belongs to an inbound Telegram turn. */
+export function isTelegramOriginContext(context = {}, fallbackNonce) {
+  if (context?.origin === "telegram") return true;
+  const nonce = fallbackNonce
+    ?? context?.clientNonce
+    ?? context?.contextKey;
+  return typeof nonce === "string" && nonce.startsWith("telegram:");
+}
+
+/** True when Telegram marks the message as forwarded (Bot API 7+ or legacy fields). */
+export function isForwardedTelegramMessage(message) {
+  return Boolean(message?.forward_origin || message?.forward_from || message?.forward_from_chat
+    || message?.forward_sender_name || message?.forward_date);
+}
+
+/** Format the live Telegram sender identity for Grok prompt context. */
+export function formatTelegramSenderHeader(from, { forwarded = false } = {}) {
+  const fields = [];
+  const id = from?.id;
+  if (Number.isSafeInteger(id) || (typeof id === "string" && /^-?\d+$/.test(id.trim()))) {
+    fields.push(`id=${String(id).trim()}`);
+  }
+  const name = [from?.first_name, from?.last_name]
+    .filter((part) => typeof part === "string" && part.trim())
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (name) fields.push(`name=${name}`);
+  if (typeof from?.username === "string") {
+    const username = from.username.trim().replace(/^@+/, "");
+    if (username) fields.push(`username=@${username}`);
+  }
+  if (fields.length && forwarded) fields.push("forwarded=yes");
+  return fields.length ? `[telegram-from] ${fields.join(" ")}` : "";
+}
+
+/** Chat identity header: `[telegram-chat] id=<chat id> type=<private|group|supergroup>`. */
+export function formatTelegramChatHeader(chat) {
+  const id = chat?.id;
+  if (!Number.isSafeInteger(id)) return "";
+  const type = typeof chat?.type === "string" && /^[a-z_]+$/.test(chat.type) ? chat.type : "unknown";
+  return `[telegram-chat] id=${id} type=${type}`;
+}
+
+function stripTelegramContextHeaders(text) {
+  if (typeof text !== "string") return text;
+  return text.replace(
+    /^(?:\[telegram-(?:from|topic|chat|group|group-hybrid)\][^\r\n]*(?:\r?\n|$)\s*)+/u,
+    "",
+  ).trim();
+}
+
+/** Drop leading Transcript: blocks from voice replies so Telegram users see only the answer. */
+export function stripTranscriptPreamble(text) {
+  if (typeof text !== "string" || !text.trim()) return text;
+  let out = text.trimStart();
+  // "Transcript: …" on its own first line (optionally followed by blank lines)
+  out = out.replace(/^Transcript\s*[:：]\s*[^\r\n]*(?:\r?\n)+/iu, "");
+  // Whole message is only a transcript line with no body — drop the label, keep spoken text after colon
+  if (/^Transcript\s*[:：]\s*/iu.test(out) && !/\r?\n/.test(out)) {
+    out = out.replace(/^Transcript\s*[:：]\s*/iu, "");
+  } else {
+    out = out.replace(/^Transcript\s*[:：]\s*/iu, "");
+  }
+  return out.trimStart();
+}
+
+
+/** Prefer forum_topic_created / edited on the message or reply chain. */
+export function resolveTelegramTopicName(message, topicNames = new Map()) {
+  const candidates = [
+    message?.forum_topic_created?.name,
+    message?.forum_topic_edited?.name,
+    message?.reply_to_message?.forum_topic_created?.name,
+    message?.reply_to_message?.forum_topic_edited?.name,
+  ];
+  for (const name of candidates) {
+    if (typeof name === "string" && name.trim()) return name.trim();
+  }
+  const threadId = message?.message_thread_id;
+  if (Number.isSafeInteger(threadId) && topicNames instanceof Map && topicNames.has(threadId)) {
+    return topicNames.get(threadId);
+  }
+  if (Number.isSafeInteger(threadId) && topicNames && typeof topicNames === "object" && !(topicNames instanceof Map)) {
+    const mapped = topicNames[threadId] ?? topicNames[String(threadId)];
+    if (typeof mapped === "string" && mapped.trim()) return mapped.trim();
+  }
+  return undefined;
+}
+
+/** Header when message_thread_id is present; name optional. */
+export function formatTelegramTopicHeader(message, topicNames = new Map()) {
+  if (!Number.isSafeInteger(message?.message_thread_id)) return "";
+  const fields = [`id=${message.message_thread_id}`];
+  const name = resolveTelegramTopicName(message, topicNames);
+  if (name) fields.push(`name=${name}`);
+  return `[telegram-topic] ${fields.join(" ")}`;
+}
+
+/** Forum General is thread 1; some General messages omit message_thread_id. */
+export function effectiveForumTopicId(message) {
+  if (Number.isSafeInteger(message?.message_thread_id)) return message.message_thread_id;
+  if (message?.chat?.is_forum === true) return 1;
+  return undefined;
+}
+
+const GROUP_HYBRID_HINT_TAG = "[telegram-group-hybrid]";
+/**
+ * Default soft-forward hint for unmapped group traffic. Override the instruction
+ * text with TELEGRAM_GROUP_HINT; the [telegram-group-hybrid] tag is kept.
+ */
+const GROUP_HYBRID_HINT = `${GROUP_HYBRID_HINT_TAG} Reply only if this message is a request you can help with or is addressed to you. Otherwise reply exactly NO_TELEGRAM_REPLY.`;
+
+/** Normalize a TELEGRAM_GROUP_HINT override; always starts with the hybrid tag. */
+export function buildGroupHybridHint(override) {
+  const text = typeof override === "string" ? override.replace(/\s+/g, " ").trim() : "";
+  if (!text) return GROUP_HYBRID_HINT;
+  return text.startsWith(GROUP_HYBRID_HINT_TAG) ? text : `${GROUP_HYBRID_HINT_TAG} ${text}`;
+}
+
+/** Normalize TELEGRAM_GROUP_KEYWORDS (array or comma-separated string). */
+export function normalizeGroupKeywords(keywords) {
+  const list = Array.isArray(keywords)
+    ? keywords
+    : typeof keywords === "string" ? keywords.split(",") : DEFAULT_GROUP_KEYWORDS;
+  return Object.freeze([...new Set(list
+    .map((keyword) => (typeof keyword === "string" ? keyword.trim().toLocaleLowerCase() : ""))
+    .filter(Boolean))]);
+}
+/** Generic hint for forum topics routed to a dedicated agent via TELEGRAM_TOPIC_AGENTS. */
+const GROUP_TOPIC_AGENT_HINT = "[telegram-group] Reply only if this is part of your job or addressed to you; otherwise reply exactly NO_TELEGRAM_REPLY.";
+
 const APPROVAL_TTL_MS = 10 * 60_000;
 const ROUTINE_WIDGET_TTL_MS = 12 * 60 * 60_000;
 const APPROVAL_TEXT_LIMIT = 3_500;
 const SKILL_LIST_LIMIT = 20;
 const ROUTINE_WIDGET_CALLBACK = /^gtw:([A-Za-z0-9_-]{24}):([0-9a-z])$/;
 const ROUTINE_WIDGET_NONCE = /^telegram:widget:([A-Za-z0-9_-]{24}):[0-9a-z]$/;
+const ATTACHMENT_READ_ATTEMPTS = 5;
+const ATTACHMENT_READ_BACKOFF_MIN_MS = 300;
+const ATTACHMENT_READ_BACKOFF_MAX_MS = 800;
 
 function approvalDetails(entry) {
   if (entry?.message?.type === "auto-review-approval") {
@@ -114,6 +376,7 @@ function messageAttachments(message) {
     ["audio", "telegram-audio.bin"],
     ["voice", "telegram-voice.ogg"],
     ["video", "telegram-video.mp4"],
+    ["video_note", "telegram-video-note.mp4"],
   ]) {
     const media = message[kind];
     if (media?.file_id) attachments.push({ fileId: media.file_id, filename: media.file_name || fallback });
@@ -121,11 +384,72 @@ function messageAttachments(message) {
   return attachments;
 }
 
-function defaultAttachmentPrompt(message) {
-  if (message.voice) return "Transcribe this voice note accurately, then respond to what I said. Do not send progress updates. Send exactly one final response beginning with 'Transcript:'.";
-  if (message.audio) return "Listen to this audio, summarize or transcribe it as appropriate, then respond.";
+function withVoiceHint(prompt, voiceHint) {
+  const hint = typeof voiceHint === "string" ? voiceHint.trim() : "";
+  return hint ? `${prompt} ${hint}` : prompt;
+}
+
+function defaultAttachmentPrompt(message, voiceHint) {
+  if (message.voice) return withVoiceHint("Voice note attached. Understand what I said and reply in one final natural message to the user (no progress updates). Prefer listening to the attachment directly. Do NOT install packages or download speech models mid-request. Do NOT include a Transcript: line or raw transcript dump in the user-visible reply — just answer as if you heard them.", voiceHint);
+  if (message.audio) return withVoiceHint("Audio attached. Understand it and reply in one final natural message. Do NOT install packages or download speech models mid-request. Do NOT put Transcript: or a raw transcript dump in the user-visible reply.", voiceHint);
   if (message.photo) return "Examine the attached image and tell me what you find.";
   return "Examine the attached file and tell me what you find.";
+}
+
+/** Neutral attachment prompt for topic-routed agents (they decide replies themselves). */
+function topicAgentAttachmentPrompt(message, voiceHint) {
+  if (message.voice) return withVoiceHint("[voice note attached] Do not install packages or download speech models to transcribe it.", voiceHint);
+  if (message.audio) return "[audio attached]";
+  if (message.photo) return "[photo attached]";
+  if (message.video || message.video_note) return "[video attached]";
+  return "[file attached]";
+}
+
+/** True for Telegram documents that are images (sent "as file", uncompressed). */
+export function isImageDocument(document) {
+  if (!document || typeof document !== "object") return false;
+  if (typeof document.mime_type === "string" && /^image\//i.test(document.mime_type)) return true;
+  return typeof document.file_name === "string"
+    && /\.(?:jpe?g|png|webp|heic|heif|gif|bmp|tiff?)$/i.test(document.file_name);
+}
+
+function hasTelegramMedia(message) {
+  return Boolean(message?.photo || message?.document || message?.video || message?.video_note
+    || message?.voice || message?.audio || message?.sticker || message?.animation);
+}
+
+/** `[photos attached: N]` for image-only bundles, otherwise a typed attachment count. */
+export function formatBundleAttachmentLabel(messages) {
+  const counts = { photo: 0, video: 0, audio: 0, file: 0 };
+  for (const message of messages ?? []) {
+    if (message?.photo || isImageDocument(message?.document)) counts.photo += 1;
+    else if (message?.video || message?.video_note) counts.video += 1;
+    else if (message?.voice || message?.audio) counts.audio += 1;
+    else if (message?.document) counts.file += 1;
+  }
+  const total = counts.photo + counts.video + counts.audio + counts.file;
+  if (total > 0 && total === counts.photo) return `[photos attached: ${total}]`;
+  const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+  const parts = [
+    counts.photo ? plural(counts.photo, "photo") : "",
+    counts.video ? plural(counts.video, "video") : "",
+    counts.audio ? plural(counts.audio, "audio file") : "",
+    counts.file ? plural(counts.file, "file") : "",
+  ].filter(Boolean);
+  return `[attachments: ${total}${parts.length ? ` (${parts.join(", ")})` : ""}]`;
+}
+
+function uniqueAttachmentNames(attachments) {
+  const seen = new Map();
+  return attachments.map((attachment) => {
+    const name = attachment.filename || "telegram-file.bin";
+    const count = seen.get(name) ?? 0;
+    seen.set(name, count + 1);
+    if (count === 0) return attachment;
+    const dot = name.lastIndexOf(".");
+    const renamed = dot > 0 ? `${name.slice(0, dot)}-${count + 1}${name.slice(dot)}` : `${name}-${count + 1}`;
+    return { ...attachment, filename: renamed };
+  });
 }
 
 function normalize(value) {
@@ -172,6 +496,33 @@ function routineDescription(routine) {
   return routine.scheduleDescription ?? routine.trigger?.schedule ?? "triggered routine";
 }
 
+
+function defaultAttachmentReadBackoffMs(attemptIndex) {
+  if (ATTACHMENT_READ_ATTEMPTS <= 2) return ATTACHMENT_READ_BACKOFF_MIN_MS;
+  const span = ATTACHMENT_READ_BACKOFF_MAX_MS - ATTACHMENT_READ_BACKOFF_MIN_MS;
+  const t = attemptIndex / Math.max(1, ATTACHMENT_READ_ATTEMPTS - 2);
+  return Math.round(ATTACHMENT_READ_BACKOFF_MIN_MS + (span * t));
+}
+
+/** Permanent attachment failures should not burn the retry budget. */
+export function isRetryableAttachmentReadError(error) {
+  const message = String(error?.message ?? error ?? "");
+  if (/exceeds 20 MB|empty or exceeds|unsupported data attachment|invalid file attachment URL/i.test(message)) {
+    return false;
+  }
+  return true;
+}
+
+function attachmentDisplayName(attachment) {
+  if (typeof attachment?.filename === "string" && attachment.filename.trim()) {
+    return attachment.filename.trim();
+  }
+  if (typeof attachment?.path === "string" && attachment.path) {
+    return attachment.path.split("/").at(-1) || "file";
+  }
+  return "file";
+}
+
 export class Bridge {
   constructor({
     telegram,
@@ -182,6 +533,14 @@ export class Bridge {
     defaultAgent,
     mirrorChatId,
     mirrorUserId,
+    allowedTopicIds,
+    topicNames,
+    topicAgents,
+    groupKeywords = DEFAULT_GROUP_KEYWORDS,
+    groupHint,
+    voicePromptHint,
+    attachmentReadAttempts = ATTACHMENT_READ_ATTEMPTS,
+    attachmentReadBackoffMs = defaultAttachmentReadBackoffMs,
   }) {
     Object.assign(this, {
       telegram,
@@ -192,30 +551,291 @@ export class Bridge {
       defaultAgent,
       mirrorChatId,
       mirrorUserId,
+      allowedTopicIds: allowedTopicIds instanceof Set ? allowedTopicIds : new Set(allowedTopicIds ?? []),
+      topicNames: topicNames instanceof Map
+        ? topicNames
+        : new Map(Object.entries(topicNames ?? {}).map(([id, name]) => [Number(id), name])),
+      topicAgents: Array.isArray(topicAgents) ? topicAgents : [],
+      groupKeywords: normalizeGroupKeywords(groupKeywords),
+      groupHybridHint: buildGroupHybridHint(groupHint),
+      voicePromptHint: typeof voicePromptHint === "string" ? voicePromptHint.trim() : "",
+      attachmentReadAttempts,
+      attachmentReadBackoffMs,
     });
+    this.botUsername = undefined;
     this.firstWatchSnapshots = new Map();
     this.agentMirrorQueues = new Map();
     this.widgetCallbackQueues = new Map();
+    // chatId -> Map(threadId -> name); seeded from persisted state.
+    this.learnedTopicNames = new Map();
+    const persisted = typeof this.state?.listTopicNames === "function" ? this.state.listTopicNames() : undefined;
+    for (const [chatKey, names] of Object.entries(persisted ?? {})) {
+      for (const [threadKey, name] of Object.entries(names ?? {})) {
+        if (/^-?\d+$/.test(chatKey) && /^\d+$/.test(threadKey) && typeof name === "string" && name) {
+          this.learnedTopicMap(Number(chatKey)).set(Number(threadKey), name);
+        }
+      }
+    }
+  }
+
+  learnedTopicMap(chatId) {
+    const key = String(chatId);
+    if (!this.learnedTopicNames.has(key)) this.learnedTopicNames.set(key, new Map());
+    return this.learnedTopicNames.get(key);
+  }
+
+  isGroupChat(chat) {
+    return chat?.type === "group" || chat?.type === "supergroup";
+  }
+
+  /**
+   * Learn forum topic names from forum_topic_created / forum_topic_edited service
+   * messages and from reply_to_message.forum_topic_created, which Telegram attaches
+   * to ordinary (non-reply) messages inside a topic. Persisted in the state file.
+   */
+  async learnTopicNameFromMessage(message) {
+    if (!this.isGroupChat(message?.chat)) return;
+    if (message.chat.is_forum !== true && message.is_topic_message !== true) return;
+    const threadId = Number.isSafeInteger(message?.message_thread_id)
+      ? message.message_thread_id
+      : undefined;
+    const name = resolveTelegramTopicName(message, new Map());
+    if (threadId === undefined || !name) return;
+    const learned = this.learnedTopicMap(message.chat.id);
+    if (learned.get(threadId) === name) return;
+    learned.set(threadId, name);
+    console.error(`topic learned chat=${message.chat.id} id=${threadId} name=${name}`);
+    try {
+      await this.state.setTopicName?.(message.chat.id, threadId, name);
+    } catch (error) {
+      console.error(`Could not persist learned topic name: ${error.message}`);
+    }
+  }
+
+  topicNameLookup(chatId) {
+    const merged = new Map(this.topicNames);
+    const learned = chatId === undefined ? undefined : this.learnedTopicNames.get(String(chatId));
+    for (const [id, name] of learned ?? []) merged.set(id, name);
+    return merged;
+  }
+
+  /**
+   * Agent id/name mapped to this message's forum topic via TELEGRAM_TOPIC_AGENTS
+   * (id match wins over name match). Undefined for DMs and unmapped topics.
+   */
+  topicAgentFor(message) {
+    if (!this.topicAgents.length || !this.isGroupChat(message?.chat)) return undefined;
+    const isForum = message.chat.is_forum === true || Number.isSafeInteger(message.message_thread_id);
+    if (!isForum) return undefined;
+    const topicId = effectiveForumTopicId(message);
+    if (topicId === undefined) return undefined;
+    const byId = this.topicAgents.find((route) => route.topicId === topicId);
+    if (byId) return byId.agent;
+    const name = resolveTelegramTopicName(message, this.topicNameLookup(message.chat.id));
+    if (!name) return undefined;
+    const wanted = normalize(name);
+    return this.topicAgents.find((route) => route.topicName !== undefined
+      && normalize(route.topicName) === wanted)?.agent;
+  }
+
+  /** Dispatcher queue key: topic-routed agents get their own per-chat queue. */
+  queueKeyForUpdate(update) {
+    const message = update?.message;
+    const chatKey = String(message?.chat?.id ?? "unknown");
+    const topicAgent = this.topicAgentFor(message);
+    return topicAgent ? `${chatKey}:agent:${topicAgent}` : chatKey;
+  }
+
+  /**
+   * DMs are never topic-filtered. Empty allowlist = all topics (safe default).
+   * Forum General (missing thread) counts as id 1. Non-forum groups are not filtered.
+   */
+  isTopicAllowlisted(message) {
+    if (!this.isGroupChat(message?.chat)) return true;
+    if (!this.allowedTopicIds || this.allowedTopicIds.size === 0) return true;
+    const isForum = message?.chat?.is_forum === true
+      || Number.isSafeInteger(message?.message_thread_id);
+    if (!isForum) return true;
+    const topicId = effectiveForumTopicId(message);
+    if (topicId === undefined) return true;
+    return this.allowedTopicIds.has(topicId) || this.topicAgentFor(message) !== undefined;
+  }
+
+  deliveryOptionsFromMessage(message) {
+    const options = {};
+    if (Number.isSafeInteger(message?.message_thread_id)) {
+      options.messageThreadId = message.message_thread_id;
+    }
+    return options;
+  }
+
+  async ensureBotUsername(options = {}) {
+    if (this.botUsername && this.botId !== undefined) return this.botUsername;
+    if (typeof this.telegram.getMe === "function") {
+      const me = await this.telegram.getMe(options);
+      if (typeof me?.username === "string" && me.username) {
+        this.botUsername = me.username;
+      }
+      if (Number.isSafeInteger(me?.id)) {
+        this.botId = me.id;
+      }
+    }
+    return this.botUsername;
+  }
+
+  messagePlainText(message) {
+    if (typeof message?.text === "string") return message.text;
+    if (typeof message?.caption === "string") return message.caption;
+    return "";
+  }
+
+  isBotMentioned(message, botUsername) {
+    if (!botUsername || !message) return false;
+    const username = botUsername.replace(/^@/, "");
+    const text = this.messagePlainText(message);
+    const entities = [
+      ...(Array.isArray(message.entities) ? message.entities : []),
+      ...(Array.isArray(message.caption_entities) ? message.caption_entities : []),
+    ];
+    for (const entity of entities) {
+      if (entity?.type === "mention" && typeof entity.offset === "number" && typeof entity.length === "number") {
+        const mention = text.slice(entity.offset, entity.offset + entity.length);
+        if (mention.toLocaleLowerCase() === `@${username}`.toLocaleLowerCase()) return true;
+      }
+      if (entity?.type === "text_mention") {
+        const mentioned = entity.user?.username;
+        if (typeof mentioned === "string"
+          && mentioned.toLocaleLowerCase() === username.toLocaleLowerCase()) {
+          return true;
+        }
+        if (Number.isSafeInteger(entity.user?.id) && entity.user.id === this.botId) {
+          return true;
+        }
+      }
+    }
+    return new RegExp(`@${username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text);
+  }
+
+  /** True when the message replies to a message from this bot (id or username). */
+  isReplyToThisBot(message, botUsername) {
+    const replyFrom = message?.reply_to_message?.from;
+    if (!replyFrom || replyFrom.is_bot !== true) return false;
+    if (Number.isSafeInteger(this.botId) && replyFrom.id === this.botId) return true;
+    const username = String(botUsername || this.botUsername || "").replace(/^@/, "");
+    if (username && typeof replyFrom.username === "string"
+      && replyFrom.username.toLocaleLowerCase() === username.toLocaleLowerCase()) {
+      return true;
+    }
+    return false;
+  }
+
+  /** True when text/caption matches a TELEGRAM_GROUP_KEYWORDS entry (case-insensitive). */
+  hasGroupKeyword(text) {
+    if (typeof text !== "string" || !text.trim()) return false;
+    const haystack = text.toLocaleLowerCase();
+    for (const keyword of this.groupKeywords ?? []) {
+      const needle = keyword.toLocaleLowerCase();
+      // CJK / multi-word phrases: substring. Latin tokens: word-boundary-ish.
+      if (/[^\x00-\x7f]/.test(keyword) || /\s/.test(keyword)) {
+        if (haystack.includes(needle)) return true;
+        continue;
+      }
+      const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`(?:^|[^a-z0-9_])${escaped}(?:[^a-z0-9_]|$)`, "i").test(haystack)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Directly addressed: slash command, bot mention, or reply to this bot. */
+  isDirectGroupAddress(message, botUsername) {
+    const text = this.messagePlainText(message).trim();
+    if (text.startsWith("/")) return true;
+    if (this.isBotMentioned(message, botUsername)) return true;
+    if (this.isReplyToThisBot(message, botUsername)) return true;
+    return false;
+  }
+
+  /** Fast-path: mention, slash, reply-to-bot, or a configured group keyword. */
+  isGroupFastPath(message, botUsername) {
+    if (this.isDirectGroupAddress(message, botUsername)) return true;
+    return this.hasGroupKeyword(this.messagePlainText(message).trim());
+  }
+
+  /**
+   * Topics routed to a dedicated agent skip the group keyword filter: forward
+   * every real text, photo (captionless too), document, video and voice note;
+   * drop only pure noise (stickers, bare acks, service messages).
+   */
+  shouldHandleTopicAgentMessage(message, botUsername) {
+    if (this.isDirectGroupAddress(message, botUsername)) return true;
+    return !isGroupNoiseMessage(message);
+  }
+
+  shouldHandleGroupMessage(message, botUsername) {
+    if (this.isGroupFastPath(message, botUsername)) return true;
+    if (isGroupNoiseMessage(message)) return false;
+    const text = this.messagePlainText(message).trim();
+    // Soft-forward: photo/document/video/voice/audio/video_note (caption optional).
+    if (message?.photo || message?.document || message?.video
+      || message?.voice || message?.video_note || message?.audio) return true;
+    // Soft-forward: meaningful non-noise text (length ≥ 2 after trim).
+    if (text && !isGroupNoiseText(text) && text.length >= 2) return true;
+    return false;
+  }
+
+  stripBotMention(text, botUsername) {
+    if (!botUsername || typeof text !== "string") return text;
+    const username = botUsername.replace(/^@/, "");
+    const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return text
+      .replace(new RegExp(`@${escaped}\\b`, "gi"), "")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   isAuthorized(message) {
-    return message?.chat?.type === "private"
-      && this.allowedUserIds.has(message?.from?.id)
-      && this.allowedChatIds.has(message?.chat?.id);
+    const chat = message?.chat;
+    if (!chat) return false;
+    if (chat.type === "private") {
+      return this.allowedUserIds.has(message?.from?.id)
+        && this.allowedChatIds.has(chat.id);
+    }
+    if (this.isGroupChat(chat)) {
+      return this.allowedChatIds.has(chat.id);
+    }
+    return false;
   }
 
   isAuthorizedCallback(callback) {
-    return this.isAuthorized({ chat: callback?.message?.chat, from: callback?.from });
+    const chat = callback?.message?.chat;
+    if (!chat) return false;
+    if (chat.type === "private") {
+      return this.allowedUserIds.has(callback?.from?.id)
+        && this.allowedChatIds.has(chat.id);
+    }
+    if (this.isGroupChat(chat)) {
+      return this.allowedChatIds.has(chat.id);
+    }
+    return false;
   }
 
-  resolveAgent(chatId, agents) {
+  resolveAgent(chatId, agents, message) {
+    const topicAgent = message ? this.topicAgentFor(message) : undefined;
+    if (topicAgent) {
+      return agents.find((agent) => agent.id === topicAgent)
+        || agents.find((agent) => normalize(agent.name) === normalize(topicAgent));
+    }
     const selectedId = this.state.getAgent(chatId);
     if (selectedId) {
       const selected = agents.find((agent) => agent.id === selectedId);
       if (selected) return selected;
       return undefined;
     }
-    return agents.find((agent) => normalize(agent.name) === normalize(this.defaultAgent));
+    const wanted = String(this.defaultAgent || "").trim();
+    return agents.find((agent) => agent.id === wanted)
+      || agents.find((agent) => normalize(agent.name) === normalize(wanted));
   }
 
   isMirrorConfigured() {
@@ -322,18 +942,157 @@ export class Bridge {
     await this.telegram.sendMessage(message.chat.id, "Use /mirror status, /mirror on, or /mirror off.", options);
   }
 
-  async handleUpdate(update, options = {}) {
+  /**
+   * Media-bundling classification used by UpdateDispatcher. Returns undefined for
+   * updates that must bypass bundling (callbacks, unauthorized, not allowlisted,
+   * unknown sender). senderKey scopes bundles to queue + topic + sender:
+   * - role "media": album item (media_group_id) or loose photo / image document
+   * - role "text": plain non-command text that may attach to an open bundle
+   * - role "other": everything else (voice, video, commands...) flushes first
+   */
+  classifyForBundling(update) {
     const message = update?.message;
-    if (!this.isAuthorized(message)) return;
+    if (!message || !this.isAuthorized(message) || !this.isTopicAllowlisted(message)) return undefined;
+    const senderId = message.sender_chat?.id ?? message.from?.id;
+    if (senderId === undefined || senderId === null) return undefined;
+    const topicId = effectiveForumTopicId(message) ?? "none";
+    const senderKey = `${this.queueKeyForUpdate(update)}|topic=${topicId}|from=${senderId}`;
+    const text = this.messagePlainText(message).trim();
+    if (!text.startsWith("/")) {
+      if (message.media_group_id
+        && (message.photo || message.video || message.document || message.audio)) {
+        return { senderKey, role: "media", album: true };
+      }
+      if (message.photo || isImageDocument(message.document)) {
+        return { senderKey, role: "media", album: false };
+      }
+      if (typeof message.text === "string" && text && !hasTelegramMedia(message)) {
+        return { senderKey, role: "text" };
+      }
+    }
+    return { senderKey, role: "other" };
+  }
+
+  /**
+   * Fold a bundle (same chat/topic/sender) into one representative message: the
+   * first item's identity/reply/forward fields, the first media item's media
+   * fields, and every item's text/caption (spoofed headers stripped per item).
+   */
+  combineBundledMessages(messages) {
+    const first = messages[0];
+    const combined = { ...first };
+    delete combined.text;
+    delete combined.entities;
+    delete combined.caption;
+    delete combined.caption_entities;
+    const pieces = [];
+    for (const item of messages) {
+      const raw = typeof item?.text === "string" ? item.text
+        : typeof item?.caption === "string" ? item.caption : "";
+      const cleaned = stripTelegramContextHeaders(raw)?.trim();
+      if (cleaned) pieces.push({ item, raw, cleaned });
+    }
+    if (pieces.length) {
+      combined.caption = pieces.map((piece) => piece.cleaned).join("\n\n");
+      if (pieces.length === 1 && pieces[0].cleaned === pieces[0].raw) {
+        const entities = pieces[0].item.caption_entities ?? pieces[0].item.entities;
+        if (Array.isArray(entities)) combined.caption_entities = entities;
+      }
+    }
+    const replyToBot = messages.find((item) => item?.reply_to_message?.from?.is_bot === true);
+    if (replyToBot) combined.reply_to_message = replyToBot.reply_to_message;
+    combined.bundleMessageIds = messages.map((item) => item?.message_id);
+    return combined;
+  }
+
+  async handleUpdate(update, options = {}) {
+    const bundledMessages = Array.isArray(update?.bundledUpdates) && update.bundledUpdates.length > 1
+      ? update.bundledUpdates.map((item) => item?.message).filter(Boolean)
+      : undefined;
+    const message = bundledMessages?.length > 1
+      ? this.combineBundledMessages(bundledMessages)
+      : update?.message;
+    const isBundle = bundledMessages?.length > 1;
+    const turnMessages = isBundle ? bundledMessages : [message];
+    if (!this.isAuthorized(message)) {
+      const chat = message?.chat;
+      console.error(
+        `Drop unauthorized update chat=${chat?.id ?? "none"} type=${chat?.type ?? "none"}`,
+      );
+      return;
+    }
+    for (const item of turnMessages) await this.learnTopicNameFromMessage(item);
+    if (!this.isTopicAllowlisted(message)) {
+      const topicId = effectiveForumTopicId(message);
+      console.error(
+        `Drop group topic not allowlisted chat=${message.chat.id} topic=${topicId ?? "none"}`,
+      );
+      return;
+    }
+    options = { ...options, ...this.deliveryOptionsFromMessage(message) };
+    const topicAgent = this.topicAgentFor(message);
+    if (this.isGroupChat(message.chat)) {
+      const botUsername = await this.ensureBotUsername(options);
+      const handle = topicAgent
+        ? this.shouldHandleTopicAgentMessage(message, botUsername)
+        : this.shouldHandleGroupMessage(message, botUsername);
+      if (!handle) {
+        // Log metadata only; message bodies stay out of bridge.log.
+        const body = String(message.text ?? message.caption ?? "");
+        const reason = topicAgent || isGroupNoiseMessage(message) || isGroupNoiseText(body)
+          ? "Drop group noise"
+          : "Drop group message (hybrid filter)";
+        console.error(
+          `${reason} chat=${message.chat.id} topic=${effectiveForumTopicId(message) ?? "none"} chars=${body.length}`,
+        );
+        return;
+      }
+    }
     const chatId = message.chat.id;
-    const incomingAttachments = messageAttachments(message);
+    const incomingAttachments = uniqueAttachmentNames(turnMessages.flatMap(messageAttachments));
     const messageText = typeof message.text === "string" ? message.text : message.caption;
     if ((!messageText || !messageText.trim()) && incomingAttachments.length === 0) {
       await this.telegram.sendMessage(chatId, "Send text, a photo, or a file attachment.", options);
       return;
     }
 
-    let text = messageText?.trim() || defaultAttachmentPrompt(message);
+    const bundleLabel = isBundle ? formatBundleAttachmentLabel(turnMessages) : "";
+    const bundleAllImages = bundleLabel.startsWith("[photos attached:");
+    const attachmentPrompt = isBundle
+      ? () => (topicAgent
+        ? bundleLabel
+        : `Examine the attached ${bundleAllImages ? "images" : "files"} and tell me what you find.`)
+      : topicAgent ? topicAgentAttachmentPrompt : defaultAttachmentPrompt;
+    let text = stripTelegramContextHeaders(messageText?.trim() || attachmentPrompt(message, this.voicePromptHint));
+    // Bundles get the attachment-count label on its own line
+    // (applied after group mention stripping so the newline survives).
+    const withBundleLabel = (value) => (isBundle && value && !value.includes(bundleLabel)
+      ? `${bundleLabel}\n${value}`
+      : value);
+    const reactAll = (emoji) => Promise.all(turnMessages.map((item) => this.telegram
+      .setMessageReaction?.(chatId, item.message_id, emoji, options)?.catch?.(() => {})));
+    let groupSoftForward = false;
+    if (this.isGroupChat(message.chat) && !text.startsWith("/")) {
+      const botUsername = await this.ensureBotUsername(options);
+      groupSoftForward = topicAgent
+        ? !this.isDirectGroupAddress(message, botUsername)
+        : !this.isGroupFastPath(message, botUsername);
+      text = this.stripBotMention(text, botUsername);
+      if (!text && incomingAttachments.length === 0) {
+        await this.telegram.sendMessage(
+          chatId,
+          "Here — mention me with a question, or try /help.",
+          { ...options, replyToMessageId: message.message_id },
+        );
+        return;
+      }
+      if (!text) text = attachmentPrompt(message, this.voicePromptHint);
+      text = withBundleLabel(text);
+      if (groupSoftForward) {
+        text = `${topicAgent ? GROUP_TOPIC_AGENT_HINT : this.groupHybridHint}\n\n${text}`;
+      }
+    }
+    text = withBundleLabel(text);
     const [rawCommand, ...rawArguments] = text.split(/\s+/);
     const command = rawCommand.toLocaleLowerCase().split("@")[0];
     if (command === "/start" || command === "/help" || command === "/commands") {
@@ -348,9 +1107,14 @@ export class Bridge {
 
     const agents = await this.grok.listAgents(options);
     if (command === "/agents") {
-      const selected = this.resolveAgent(chatId, agents);
+      const selected = this.resolveAgent(chatId, agents, message);
       const lines = agents.map((agent) => `${agent.id === selected?.id ? "*" : "-"} ${agent.name}`);
       await this.telegram.sendMessage(chatId, lines.length ? lines.join("\n") : "No Grok agents are available.", options);
+      return;
+    }
+
+    if (command === "/use" && topicAgent) {
+      await this.telegram.sendMessage(chatId, "This topic has a fixed agent (TELEGRAM_TOPIC_AGENTS); /use is disabled here.", options);
       return;
     }
 
@@ -370,7 +1134,12 @@ export class Bridge {
     }
 
     const selectedId = this.state.getAgent(chatId);
-    const agent = this.resolveAgent(chatId, agents);
+    const agent = this.resolveAgent(chatId, agents, message);
+    if (!agent && topicAgent) {
+      // Never fall back to the default agent for a routed topic; stay quiet in the group.
+      console.error(`Topic agent not found chat=${chatId} topic=${effectiveForumTopicId(message)} agent=${JSON.stringify(topicAgent)}`);
+      return;
+    }
     if (!agent) {
       const target = selectedId ? "selected agent" : `default agent “${this.defaultAgent}”`;
       await this.telegram.sendMessage(chatId, `Could not find the ${target}. Use /agents and /use.`, options);
@@ -486,9 +1255,27 @@ export class Bridge {
       ];
       references = findStructuredReferences(text, candidates);
     }
+    const headerLines = [];
+    const senderHeader = formatTelegramSenderHeader(message.from, {
+      forwarded: isForwardedTelegramMessage(message),
+    });
+    if (senderHeader) headerLines.push(senderHeader);
+    const chatHeader = formatTelegramChatHeader(message.chat);
+    if (chatHeader) headerLines.push(chatHeader);
+    const topicHeader = formatTelegramTopicHeader(message, this.topicNameLookup(chatId));
+    if (topicHeader) headerLines.push(topicHeader);
+    if (headerLines.length) {
+      const promptPrefix = `${headerLines.join("\n")}\n\n`;
+      text = `${promptPrefix}${text}`;
+      references = references?.map((reference) => ({
+        ...reference,
+        start: reference.start + promptPrefix.length,
+        end: reference.end + promptPrefix.length,
+      }));
+    }
     const richText = buildRichText(text, references ?? []);
-    await this.telegram.sendChatAction?.(chatId, "typing", options);
-    await this.telegram.setMessageReaction?.(chatId, message.message_id, "👀", options).catch(() => {});
+    await this.telegram.sendChatAction?.(chatId, "typing", options).catch(() => {});
+    await reactAll("👀");
     const attachmentPaths = [];
     const attachmentNames = [];
     for (const attachment of incomingAttachments) {
@@ -497,7 +1284,32 @@ export class Bridge {
       attachmentPaths.push(await this.grok.uploadAttachment(agent.id, filename, downloaded.bytes, options));
       attachmentNames.push(filename);
     }
-    const clientNonce = `telegram:${update.update_id}:${chatId}:${message.message_id ?? 0}`;
+    const clientNonce = `telegram:${update.update_id}:${chatId}:${message.message_id ?? 0}${isBundle ? `:b${turnMessages.length}` : ""}`;
+    if (isBundle) {
+      console.error(`Media bundle turn chat=${chatId} topic=${effectiveForumTopicId(message) ?? "none"} agent=${agent.id} messages=${turnMessages.length} attachments=${incomingAttachments.length}`);
+    }
+    // One inbound Telegram update → one outbound reply. Re-dispatched update_ids
+    // (poll ACK races) must not sendPrompt/deliver again after the turn retires.
+    if (this.state.isPromptTurnRetired?.(agent.id, clientNonce)) {
+      await reactAll("✅");
+      return;
+    }
+    const existingContext = this.state.getPromptContext?.(agent.id, clientNonce);
+    if (existingContext) {
+      if (existingContext.awaitingCompletion) {
+        await this.waitForOwnedReply(agent.id, clientNonce, {
+          ...options,
+          onApproval: (entry) => this.sendApproval(chatId, agent.id, entry, {
+            ...options,
+            approvalUserId: message.from.id,
+            replyToMessageId: message.message_id,
+          }),
+        }, this.mirrorEnabled() && chatId === this.mirrorChatId);
+      }
+      await this.deliverPromptContextThroughOwner(agent, clientNonce, options);
+      await reactAll("✅");
+      return;
+    }
     await this.grok.sendPrompt(agent.id, text, clientNonce, {
       ...options,
       attachmentPaths,
@@ -510,6 +1322,7 @@ export class Bridge {
       origin: "telegram",
       chatId,
       replyToMessageId: message.message_id,
+      messageThreadId: options.messageThreadId,
       awaitingCompletion: true,
     });
     await this.waitForOwnedReply(agent.id, clientNonce, {
@@ -521,7 +1334,7 @@ export class Bridge {
       }),
     }, this.mirrorEnabled() && chatId === this.mirrorChatId);
     await this.deliverPromptContextThroughOwner(agent, clientNonce, options);
-    await this.telegram.setMessageReaction?.(chatId, message.message_id, "✅", options).catch(() => {});
+    await reactAll("✅");
   }
 
   async pollDesktopMirrorOnce(options = {}) {
@@ -680,7 +1493,7 @@ export class Bridge {
           attachments: reply.attachments,
           options,
         });
-        await this.state.deleteDeliveryProgress?.(deliveryKey);
+        // Keep completed deliveryKey progress for idempotent re-entry.
       }
       await this.state.setMirrorCursor(agent.id, entry.id);
     }
@@ -732,12 +1545,20 @@ export class Bridge {
     });
     const replyOptions = { ...options, replyToMessageId: mirroredPrompt.message_id };
     for (const attachment of prompt.attachments ?? []) {
-      const bytes = await this.grok.readAttachment(agent.id, attachment.path, options);
-      await this.telegram.sendAttachment(
-        this.mirrorChatId,
-        { ...attachment, bytes, caption: attachment.caption || "Desktop prompt attachment" },
-        replyOptions,
-      );
+      try {
+        const bytes = await this.readAttachmentWithRetry(agent.id, attachment.path, options);
+        await this.telegram.sendAttachment(
+          this.mirrorChatId,
+          { ...attachment, bytes, caption: attachment.caption || "Desktop prompt attachment" },
+          replyOptions,
+        );
+      } catch {
+        await this.telegram.sendMessage(
+          this.mirrorChatId,
+          `File wasn't ready to send (${attachmentDisplayName(attachment)}).`,
+          { ...replyOptions, inlineKeyboard: undefined },
+        );
+      }
     }
     const reply = await this.waitForOwnedReply(agent.id, clientNonce, {
       ...waitOptions,
@@ -856,7 +1677,9 @@ export class Bridge {
     const replyEntries = entries.slice(promptIndex + 1, turnEnd)
       .filter((entry) => entry?.kind === "send-message");
     const contextKey = context.contextKey ?? promptEntry.clientNonce ?? promptEntry.id;
+    const telegramOrigin = isTelegramOriginContext(context, context.clientNonce ?? promptEntry.clientNonce ?? contextKey);
     let delivered = 0;
+    let sawCompletionMarker = !context.completionEntryId;
     for (const entry of replyEntries) {
       if (typeof entry?.id !== "string" || !entry.id) {
         throw new Error("Grok returned no transcript cursor for a recovered prompt update");
@@ -864,37 +1687,61 @@ export class Bridge {
       const alreadyDelivered = context.deliveredEntryIds?.includes(entry.id);
       const reply = this.grok.getReplyContent([entry]);
       const provenReply = entry.id === context.completionEntryId;
-      const neutral = !provenReply;
-      const text = reply.text
-        ? neutral ? `Grok update · ${agent.name}\n\n${reply.text}` : reply.text
-        : !(reply.attachments ?? []).length
-          ? "Grok produced an update that Telegram cannot render safely. Open Grok Bot to view it."
-          : undefined;
+      // Telegram-originated turns own every send-message in the turn for the chat.
+      const deliverAsOwned = provenReply || telegramOrigin;
+      const neutral = !deliverAsOwned;
+      const silent = isSilentTelegramReply(reply.text, reply.attachments);
+      const cleanedReplyText = typeof reply.text === "string"
+        ? stripTranscriptPreamble(reply.text)
+        : reply.text;
+      const text = silent
+        ? undefined
+        : cleanedReplyText
+          ? neutral ? `Grok update · ${agent.name}\n\n${cleanedReplyText}` : cleanedReplyText
+          : !(reply.attachments ?? []).length
+            ? "Grok produced an update that Telegram cannot render safely. Open Grok Bot to view it."
+            : undefined;
       const deliveryKey = `prompt:${agent.id}:${promptEntry.id}:${entry.id}`;
-      const canDeliver = provenReply || this.isMirrorConfigured();
+      const canDeliver = deliverAsOwned || this.isMirrorConfigured();
       if (!alreadyDelivered && canDeliver) {
         await this.deliverTelegramParts({
           deliveryKey,
-          chatId: provenReply ? context.chatId ?? this.mirrorChatId : this.mirrorChatId,
+          chatId: deliverAsOwned ? context.chatId ?? this.mirrorChatId : this.mirrorChatId,
           agentId: agent.id,
           text,
-          attachments: reply.attachments,
-          options: provenReply && context.replyToMessageId
-            ? { ...options, replyToMessageId: context.replyToMessageId }
+          attachments: silent ? [] : reply.attachments,
+          options: deliverAsOwned
+            ? {
+              ...options,
+              ...(context.replyToMessageId ? { replyToMessageId: context.replyToMessageId } : {}),
+              ...(Number.isSafeInteger(context.messageThreadId)
+                ? { messageThreadId: context.messageThreadId }
+                : {}),
+            }
             : options,
         });
         context.deliveredEntryIds = [...(context.deliveredEntryIds ?? []), entry.id];
         await this.state.setPromptContext?.(agent.id, contextKey, context);
-        await this.state.deleteDeliveryProgress?.(deliveryKey);
+        // Keep completed deliveryKey progress for idempotent re-entry.
         delivered += 1;
       }
       if (advanceCursor && canDeliver) await this.state.setMirrorCursor(agent.id, entry.id);
       if (entry.id === context.completionEntryId) {
-        await this.retirePromptTurn(agent.id, contextKey, entry.id);
-        break;
+        sawCompletionMarker = true;
+        if (!telegramOrigin) {
+          await this.retirePromptTurn(agent.id, contextKey, entry.id);
+          break;
+        }
+        // Telegram: keep delivering later siblings; retire once after the loop.
       }
     }
-    if (advanceCursor && !context.completionEntryId && nextPromptOffset >= 0) {
+    if (telegramOrigin && sawCompletionMarker && replyEntries.length) {
+      await this.retirePromptTurn(
+        agent.id,
+        contextKey,
+        replyEntries.at(-1)?.id ?? context.completionEntryId ?? promptEntry.id,
+      );
+    } else if (advanceCursor && !context.completionEntryId && nextPromptOffset >= 0) {
       if (!replyEntries.length) await this.state.setMirrorCursor(agent.id, promptEntry.id);
       await this.retirePromptTurn(agent.id, contextKey, replyEntries.at(-1)?.id ?? promptEntry.id);
     }
@@ -1022,16 +1869,72 @@ export class Bridge {
     return entries.find((candidate) => candidate?.clientNonce === clientNonce);
   }
 
-  async deliverTelegramParts({ deliveryKey, chatId, agentId, text, attachments = [], options = {} }) {
-    const parts = [
-      ...(text ? [{ type: "text", text }] : []),
-      ...attachments.map((attachment) => ({ type: "attachment", attachment })),
-    ];
-    let progress = this.state.getDeliveryProgress?.(deliveryKey);
-    if (!progress) {
-      progress = { nextPart: 0, claimed: true };
-      await this.state.setDeliveryProgress?.(deliveryKey, progress);
+  async readAttachmentWithRetry(agentId, attachmentPath, options = {}) {
+    const attempts = Number.isSafeInteger(this.attachmentReadAttempts) && this.attachmentReadAttempts > 0
+      ? this.attachmentReadAttempts
+      : ATTACHMENT_READ_ATTEMPTS;
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return await this.grok.readAttachment(agentId, attachmentPath, options);
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableAttachmentReadError(error) || attempt >= attempts) break;
+        const backoffMs = typeof this.attachmentReadBackoffMs === "function"
+          ? this.attachmentReadBackoffMs(attempt - 1)
+          : defaultAttachmentReadBackoffMs(attempt - 1);
+        await sleep(Math.max(0, backoffMs), undefined, { signal: options.signal });
+      }
     }
+    throw lastError;
+  }
+
+  async deliverTelegramParts({ deliveryKey, chatId, agentId, text, attachments = [], options = {} }) {
+    let deliveryText = text;
+    let deliveryAttachments = attachments ?? [];
+    if (isSilentTelegramReply(deliveryText, deliveryAttachments)) {
+      deliveryText = undefined;
+      deliveryAttachments = [];
+    }
+    const parts = [
+      ...(deliveryText ? [{ type: "text", text: deliveryText }] : []),
+      ...deliveryAttachments.map((attachment) => ({ type: "attachment", attachment })),
+    ];
+    if (!parts.length) {
+      if (this.state.completeDeliveryProgress) {
+        await this.state.completeDeliveryProgress(deliveryKey, { nextPart: 0 });
+      }
+      return;
+    }
+
+    // Idempotent deliveryKey: a completed claim must never sendMessage again.
+    // Claim synchronously before any await so a concurrent deliver cannot both send.
+    let progress;
+    if (typeof this.state.claimDeliveryProgress === "function") {
+      const claim = this.state.claimDeliveryProgress(deliveryKey);
+      if (claim.completed) return;
+      progress = claim.progress;
+      if (claim.isNewClaim) {
+        await this.state.setDeliveryProgress?.(deliveryKey, progress);
+      }
+    } else {
+      progress = this.state.getDeliveryProgress?.(deliveryKey);
+      if (progress?.completed) return;
+      if (!progress) {
+        progress = { nextPart: 0, claimed: true, completed: false };
+        await this.state.setDeliveryProgress?.(deliveryKey, progress);
+      }
+    }
+    if (progress.nextPart >= parts.length) {
+      progress.completed = true;
+      if (this.state.completeDeliveryProgress) {
+        await this.state.completeDeliveryProgress(deliveryKey, progress);
+      } else {
+        await this.state.setDeliveryProgress?.(deliveryKey, progress);
+      }
+      return;
+    }
+
     for (let index = progress.nextPart; index < parts.length; index += 1) {
       const part = parts[index];
       if (part.type === "text") {
@@ -1050,13 +1953,34 @@ export class Bridge {
         }
         delete progress.nextTextChunk;
       } else {
-        const bytes = await this.grok.readAttachment(agentId, part.attachment.path, options);
         const attachmentOptions = Number.isSafeInteger(progress.rootMessageId)
           ? { ...options, replyToMessageId: progress.rootMessageId }
           : options;
-        await this.telegram.sendAttachment(chatId, { ...part.attachment, bytes }, attachmentOptions);
+        try {
+          const bytes = await this.readAttachmentWithRetry(agentId, part.attachment.path, options);
+          await this.telegram.sendAttachment(chatId, { ...part.attachment, bytes }, attachmentOptions);
+        } catch {
+          // Retries exhausted: notify once, record failure, advance so we do not infinite-loop.
+          const notice = `File wasn't ready to send (${attachmentDisplayName(part.attachment)}).`;
+          await this.telegram.sendMessage(chatId, notice, {
+            ...attachmentOptions,
+            inlineKeyboard: undefined,
+          });
+          progress.attachmentUnavailable = true;
+          progress.failedAttachmentParts = [...(progress.failedAttachmentParts ?? []), index];
+        }
       }
       progress.nextPart = index + 1;
+      await this.state.setDeliveryProgress?.(deliveryKey, progress);
+    }
+
+    // Retire the deliveryKey as completed *before* any second caller can re-send.
+    // Completed covers full success OR after an explicit unavailable notice was recorded.
+    // Do not delete progress — deletion was the double-delivery hole.
+    progress.completed = true;
+    if (this.state.completeDeliveryProgress) {
+      await this.state.completeDeliveryProgress(deliveryKey, progress);
+    } else {
       await this.state.setDeliveryProgress?.(deliveryKey, progress);
     }
   }
@@ -1336,6 +2260,9 @@ export class Bridge {
 
   async handleCallbackQuery(update, options = {}) {
     const callback = update?.callback_query;
+    if (callback?.message) {
+      options = { ...options, ...this.deliveryOptionsFromMessage(callback.message) };
+    }
     if (!this.isAuthorizedCallback(callback)) return;
     const widgetMatch = ROUTINE_WIDGET_CALLBACK.exec(callback.data ?? "");
     if (widgetMatch) {
@@ -1443,13 +2370,26 @@ export class Bridge {
   async handleError(update, options = {}) {
     const message = update?.message;
     if (!this.isAuthorized(message)) return;
-    await this.telegram.setMessageReaction?.(message.chat.id, message.message_id, "❌", options).catch(() => {});
+    options = { ...options, ...this.deliveryOptionsFromMessage(message) };
+    const failedMessages = Array.isArray(update?.bundledUpdates) && update.bundledUpdates.length > 1
+      ? update.bundledUpdates.map((item) => item?.message).filter(Boolean)
+      : [message];
+    for (const item of failedMessages) {
+      await this.telegram.setMessageReaction?.(message.chat.id, item.message_id, "❌", options)?.catch?.(() => {});
+    }
     await this.telegram.sendMessage(
       message.chat.id,
       "I couldn't finish that request. Please try again, or open Grok Bot if the request needs a desktop approval.",
       { ...options, replyToMessageId: message.message_id },
-    ).catch(() => {});
+    ).catch((error) => {
+      console.error("handleError sendMessage failed:", error.message);
+    });
   }
 }
 
-export { HELP };
+export {
+  HELP,
+  GROUP_HYBRID_HINT,
+  GROUP_TOPIC_AGENT_HINT,
+  stripTelegramContextHeaders
+};

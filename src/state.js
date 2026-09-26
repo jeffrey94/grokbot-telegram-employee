@@ -18,6 +18,7 @@ export class JsonStateStore {
     this.promptContexts = {};
     this.retiredPromptTurns = {};
     this.pendingDeliveries = {};
+    this.topicNamesByChat = {};
     this.saveQueue = Promise.resolve();
   }
 
@@ -61,6 +62,9 @@ export class JsonStateStore {
       this.pendingDeliveries = parsed.pendingDeliveries && typeof parsed.pendingDeliveries === "object"
         ? parsed.pendingDeliveries
         : {};
+      this.topicNamesByChat = parsed.topicNamesByChat && typeof parsed.topicNamesByChat === "object"
+        ? parsed.topicNamesByChat
+        : {};
       const approvalsChanged = this.#pruneExpiredApprovals();
       const promptContextsChanged = this.#preparePromptContextsAfterLoad();
       if (approvalsChanged || promptContextsChanged) await this.#save();
@@ -80,6 +84,24 @@ export class JsonStateStore {
   async setAgent(chatId, agentId) {
     this.agentsByChat[String(chatId)] = agentId;
     await this.#save();
+  }
+
+  /** Learned forum topic names: { "<chatId>": { "<threadId>": "<name>" } }. */
+  listTopicNames() {
+    return this.topicNamesByChat;
+  }
+
+  getTopicName(chatId, threadId) {
+    const name = this.topicNamesByChat[String(chatId)]?.[String(threadId)];
+    return typeof name === "string" && name ? name : undefined;
+  }
+
+  async setTopicName(chatId, threadId, name) {
+    if (this.getTopicName(chatId, threadId) === name) return false;
+    const chatKey = String(chatId);
+    this.topicNamesByChat[chatKey] = { ...(this.topicNamesByChat[chatKey] ?? {}), [String(threadId)]: name };
+    await this.#save();
+    return true;
   }
 
   isMirrorEnabled(configured) {
@@ -158,6 +180,10 @@ export class JsonStateStore {
     await this.#save();
   }
 
+  isPromptTurnRetired(agentId, clientNonce) {
+    return Object.hasOwn(this.retiredPromptTurns, promptTurnBoundaryKey(agentId, clientNonce));
+  }
+
   async retirePromptTurn(agentId, clientNonce, entryId) {
     const key = promptTurnBoundaryKey(agentId, clientNonce);
     delete this.promptTurnBoundaries[key];
@@ -222,14 +248,53 @@ export class JsonStateStore {
     return this.pendingDeliveries[key];
   }
 
+  /**
+   * Synchronously claim a delivery key so concurrent awaiters cannot both send.
+   * Returns { progress, completed, isNewClaim }.
+   */
+  claimDeliveryProgress(key) {
+    const existing = this.pendingDeliveries[key];
+    if (existing?.completed) {
+      return { progress: existing, completed: true, isNewClaim: false };
+    }
+    if (existing) {
+      return { progress: existing, completed: false, isNewClaim: false };
+    }
+    const progress = { nextPart: 0, claimed: true, completed: false };
+    this.pendingDeliveries[key] = progress;
+    return { progress, completed: false, isNewClaim: true };
+  }
+
   async setDeliveryProgress(key, progress) {
     this.pendingDeliveries[key] = progress;
+    this.#pruneCompletedDeliveries();
+    await this.#save();
+  }
+
+  async completeDeliveryProgress(key, progress = {}) {
+    const current = this.pendingDeliveries[key] ?? {};
+    this.pendingDeliveries[key] = {
+      ...current,
+      ...progress,
+      claimed: true,
+      completed: true,
+    };
+    this.#pruneCompletedDeliveries();
     await this.#save();
   }
 
   async deleteDeliveryProgress(key) {
     delete this.pendingDeliveries[key];
     await this.#save();
+  }
+
+  #pruneCompletedDeliveries() {
+    const completedKeys = Object.entries(this.pendingDeliveries)
+      .filter(([, progress]) => progress?.completed)
+      .map(([key]) => key);
+    for (const expiredKey of completedKeys.slice(0, Math.max(0, completedKeys.length - 200))) {
+      delete this.pendingDeliveries[expiredKey];
+    }
   }
 
   #pruneExpiredApprovals(now = Date.now()) {
@@ -272,6 +337,7 @@ export class JsonStateStore {
           ? { retiredPromptTurns: this.retiredPromptTurns }
           : {}),
         ...(Object.keys(this.pendingDeliveries).length ? { pendingDeliveries: this.pendingDeliveries } : {}),
+        ...(Object.keys(this.topicNamesByChat).length ? { topicNamesByChat: this.topicNamesByChat } : {}),
       })}\n`;
       await writeFile(temporary, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
       await rename(temporary, this.filename);

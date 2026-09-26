@@ -4,11 +4,13 @@
 
 **A self-hosted Telegram gateway for [Grok Bot](https://grok.com)'s remote computer**
 
-[![CI](https://github.com/SSBrouhard/grokbot-telegram-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/SSBrouhard/grokbot-telegram-bridge/actions/workflows/ci.yml)
 [![Node.js 20.6+](https://img.shields.io/badge/Node.js-20.6%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 </div>
+
+> [!NOTE]
+> **This is a fork** of [SSBrouhard/grokbot-telegram-bridge](https://github.com/SSBrouhard/grokbot-telegram-bridge), created by the **grokbot-telegram-bridge contributors** (see [LICENSE](LICENSE)) and maintained upstream by [@SSBrouhard](https://github.com/SSBrouhard). Many thanks to the original author for a careful, security-first bridge that made this work possible. The fork keeps the upstream MIT license and copyright notice unchanged. See [What this fork adds](#what-this-fork-adds) and [Fork configuration](#fork-configuration). To install the fork, follow [Install](#install), which clones this repository (`jeffrey94/grokbot-telegram-employee`) rather than upstream.
 
 > [!IMPORTANT]
 > **Unofficial project.** This bridge is not affiliated with, endorsed by, or supported by xAI, Grok, or Telegram.
@@ -17,16 +19,66 @@ The bridge runs **inside Grok Bot's remote computer**, long-polls Telegram over 
 
 | At a glance | Contract |
 | --- | --- |
-| **Access** | Private chats matching **both** user and chat allowlists |
+| **Access** | Private chats matching **both** user and chat allowlists; in this fork, also allowlisted groups and forum supergroups |
 | **Network** | Outbound Telegram Bot API + loopback Sand gateway; no inbound ports |
 | **Runtime** | Node.js 20.6+ with zero registry dependencies — **no `npm install`** |
 | **Delivery** | Durable state with at-least-once delivery semantics |
-| **Media** | Text, photos, voice, audio, video, and files; 20 MB Bot API cap |
+| **Media** | Text, photos (albums bundled into one turn), voice, audio, video, video notes, and files; 20 MB Bot API cap |
 
 > [!CAUTION]
 > If `TELEGRAM_ALLOWED_USER_IDS` or `TELEGRAM_ALLOWED_CHAT_IDS` is wrong, the bot ignores everyone, including you. If `GROK_GATEWAY_URL` is not loopback, the process refuses to start.
 
-**[Install](#install)** · **[Security boundary](#security-boundary)** · **[Commands](#telegram-commands)** · **[Desktop mirroring](#desktop-mirroring)** · **[Operations](#operations)** · **[Limitations](#limitations)**
+**[What this fork adds](#what-this-fork-adds)** · **[Fork configuration](#fork-configuration)** · **[Install](#install)** · **[Security boundary](#security-boundary)** · **[Commands](#telegram-commands)** · **[Desktop mirroring](#desktop-mirroring)** · **[Operations](#operations)** · **[Limitations](#limitations)**
+
+## What this fork adds
+
+In plain language, compared with upstream:
+
+- **Groups and forum topics.** The bot can live in Telegram groups and forum supergroups whose chat ID is in `TELEGRAM_ALLOWED_CHAT_IDS`. Replies go back into the same forum topic. The forum "General" topic (thread id 1) is handled correctly.
+- **A hybrid group filter.** In groups the bot always answers mentions, slash commands, replies to its own messages, and (optionally) messages containing configured keywords. Other meaningful messages (text, photos, files, voice notes) are "soft-forwarded" with a short instruction telling the agent to reply only when it should, and to otherwise answer exactly `NO_TELEGRAM_REPLY`, which the bridge turns into silence. Plain chatter such as "ok", "thanks", emoji, stickers, and join/leave notices is dropped before it reaches Grok.
+- **Context headers for the agent.** Every prompt starts with `[telegram-from]` (sender id, name, username, and `forwarded=yes` for forwarded messages), `[telegram-chat]` (chat id and type), and, in forums, `[telegram-topic]` (topic id and name). Lines at the start of a user's message that imitate these headers are stripped, so users cannot spoof another sender, chat, or topic.
+- **Per-topic agent routing.** `TELEGRAM_TOPIC_AGENTS` sends each forum topic to its own Grok agent, matched by topic id first and then by topic name. Routed topics get their own queue so a slow agent does not block other topics, skip the keyword filter, and cannot be switched with `/use`. If a routed agent is missing, the bridge stays quiet instead of falling back to the default agent.
+- **Topic-name learning.** Topic names are learned from Telegram's topic-created/renamed service messages and saved in the state file, so name-based routing and topic headers keep working after a restart.
+- **Photo bundling.** An album, or a quick burst of photos from the same person in the same topic, plus the text they send right after, becomes **one** Grok turn with all images attached and an `[photos attached: N]` label, instead of one turn per photo.
+- **Voice notes and video notes.** Voice notes are forwarded with an instruction to answer naturally without a `Transcript:` dump (a leading `Transcript:` line is also stripped from replies). Round video notes are forwarded as attachments.
+- **More reliable delivery.** Every message the agent sends during a Telegram-originated turn (for example an acknowledgement, the answer, and a PDF) is delivered to that chat, once. Delivery progress is claimed before sending so a retry cannot send the same reply twice, Telegram update offsets are only acknowledged after the update was handled, and reading a Grok file is retried a few times before the bridge posts a short "file wasn't ready" notice.
+- **Agent lookup by id.** `GROK_DEFAULT_AGENT` and topic routes accept a Grok agent id as well as an exact agent name.
+- **Operations.** `deploy/bridge-control.sh` clears inherited bridge environment variables before starting, so the values in `.env` always win. Telegram API rejections now include Telegram's error description in logs.
+
+## Fork configuration
+
+All of these are optional. Unset means the fork behaves like upstream for private chats, with groups off unless you allowlist a group chat ID.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `TELEGRAM_ALLOWED_CHAT_IDS` | required | Upstream variable. In this fork a **group or supergroup ID** (negative, for example `-1001234567890`) may be listed; then **any member** of that group can talk to the bot. Private chats still need both user and chat allowlists. |
+| `TELEGRAM_ALLOWED_TOPIC_IDS` | all topics | Comma-separated forum topic ids the bot listens to. `1` is General. Private chats and non-forum groups are never topic-filtered. Topics listed in `TELEGRAM_TOPIC_AGENTS` are always admitted. |
+| `TELEGRAM_TOPIC_NAMES` | none | JSON object of topic id to display name for the `[telegram-topic]` header, e.g. `{"111":"Example Topic"}`. Learned names are merged on top. |
+| `TELEGRAM_TOPIC_AGENTS` | none | Comma-separated `<topicIdOrName>=<agentIdOrName>` pairs, e.g. `222=00000000-0000-0000-0000-000000000000,Example Topic=Example Agent`. Numeric keys are topic ids and win over names; name keys are case-insensitive. |
+| `TELEGRAM_GROUP_KEYWORDS` | none | Comma-separated, case-insensitive fast-path keywords, e.g. `support,help desk,ticket`. A group message containing one is forwarded like a mention (no soft-forward hint). Single Latin words match on word boundaries; phrases and CJK text match as substrings. |
+| `TELEGRAM_GROUP_HINT` | generic hint | Replaces the instruction prepended to soft-forwarded group messages in unmapped topics. The `[telegram-group-hybrid]` tag is added automatically. Tell the agent to answer exactly `NO_TELEGRAM_REPLY` when it should stay silent. |
+| `TELEGRAM_VOICE_PROMPT_HINT` | none | Extra text appended to voice-note and audio prompts, for example which local transcription tool the agent may use. |
+| `TELEGRAM_MEDIA_BUNDLING` | `on` | Set `off` to disable photo/album bundling. |
+| `TELEGRAM_BUNDLE_ALBUM_DEBOUNCE_MS` | `1800` | An album closes this long after its last item. |
+| `TELEGRAM_BUNDLE_BURST_WINDOW_MS` | `3000` | Loose photos from the same sender close this long after the last one. A text message from the same sender inside the window is used as the bundle's caption. |
+| `TELEGRAM_BUNDLE_MAX_WAIT_MS` | `8000` | Hard cap from the first item. |
+| `TELEGRAM_BUNDLE_MAX_ITEMS` | `10` | Close a bundle once it holds this many items (Telegram's album maximum is 10). |
+
+### Setting up a group or forum
+
+1. In BotFather, add the bot to your group. For the bot to see ordinary group messages (not only commands and mentions), either make it a group admin or turn off privacy mode with `/setprivacy`.
+2. Stop the bridge (the helper consumes pending updates), send a message in the group, run `npm run discover-ids`, and add the group's negative `chat=` id to `TELEGRAM_ALLOWED_CHAT_IDS`.
+3. For forums, optionally restrict topics with `TELEGRAM_ALLOWED_TOPIC_IDS` and route topics to agents with `TELEGRAM_TOPIC_AGENTS`. A topic's id is the `message_thread_id` shown in the `[telegram-topic]` header or in the log line `topic learned chat=... id=... name=...`.
+4. Optionally set `TELEGRAM_GROUP_KEYWORDS` and `TELEGRAM_GROUP_HINT` so the default agent knows which group requests it owns. For example, a support team might use:
+
+   ```sh
+   TELEGRAM_GROUP_KEYWORDS=support,help desk,ticket
+   TELEGRAM_GROUP_HINT="Reply only to support requests or follow-ups to your own answers. Otherwise reply exactly NO_TELEGRAM_REPLY."
+   ```
+
+5. Restart the bridge. Its startup log shows how many chats, topics, keywords, and topic routes were loaded.
+
+Agents that serve groups should be told (in their own instructions) that a reply of exactly `NO_TELEGRAM_REPLY`, `[NO_TELEGRAM_REPLY]`, or `⟦noreply⟧` means "say nothing in Telegram".
 
 ## Install
 
@@ -43,7 +95,7 @@ This project does not run Grok for you. If the desktop agent and local gateway a
 Copy the project onto the Grok computer's persistent volume. The control script defaults to `/home/box/grokbot-telegram-bridge`; for an existing installation elsewhere, export `BRIDGE_HOME` instead of moving files.
 
 ```sh
-git clone https://github.com/ssbrouhard/grokbot-telegram-bridge.git /home/box/grokbot-telegram-bridge
+git clone https://github.com/jeffrey94/grokbot-telegram-employee.git /home/box/grokbot-telegram-bridge
 cd /home/box/grokbot-telegram-bridge
 cp .env.example .env
 chmod 600 .env
@@ -89,7 +141,9 @@ From the allowed Telegram account, send `/help`. You should get the command list
 
 ## Security boundary
 
-Every inbound update must be a **private** chat and match **both** `TELEGRAM_ALLOWED_USER_IDS` and `TELEGRAM_ALLOWED_CHAT_IDS`. Keep both allowlists set and narrow. Unauthorized updates are dropped with no reply.
+Every inbound private-chat update must match **both** `TELEGRAM_ALLOWED_USER_IDS` and `TELEGRAM_ALLOWED_CHAT_IDS`. Keep both allowlists set and narrow. Unauthorized updates are dropped with no reply.
+
+**Fork change:** a group or supergroup is authorized by its chat ID alone. Once a group ID is in `TELEGRAM_ALLOWED_CHAT_IDS`, every member of that group can prompt the bot, so only allowlist groups whose membership you control. Sender identity is passed to the agent in the `[telegram-from]` header, and spoofed header lines in message text are stripped, but the agent must still decide what each sender may ask for.
 
 - `GROK_GATEWAY_URL` must use the exact host `127.0.0.1`, `localhost`, or `::1`. The Grok token is sent only to that loopback URL, and gateway redirects are refused.
 - The Telegram token is sent only to `api.telegram.org`. Neither token is logged.
@@ -122,7 +176,7 @@ Treat Telegram account security as part of this boundary. Enable Telegram two-st
 - Relays Telegram-safe autonomous routine choice cards as one-time inline buttons in the configured mirror chat.
 - Persists Telegram offsets, per-chat agent selection, desktop-mirror cursors and override, pending approvals, and pending routine-card intents so a restart does not lose that state.
 
-Voice notes are forwarded with an explicit transcription instruction. Replies use safe Telegram HTML when conversion succeeds, otherwise plain text. The bridge sends typing actions and success or error reactions. It does not stream partial responses and does not support Telegram topics, groups, channels, or webhooks.
+Voice notes are forwarded with an instruction to answer naturally (see `TELEGRAM_VOICE_PROMPT_HINT`). Replies use safe Telegram HTML when conversion succeeds, otherwise plain text. The bridge sends typing actions and success or error reactions. It does not stream partial responses and does not support channels or webhooks. Groups and forum topics are supported by this fork; see [What this fork adds](#what-this-fork-adds).
 
 ## Telegram commands
 
@@ -190,7 +244,9 @@ To uninstall: `stop`, delete the project directory (including `.env` and `bridge
 | `Missing .../.env` or mode error | `.env` must exist and be mode `600` |
 | Gateway token or state file rejected | `chmod 600` the file; it must be a regular file, not a symlink |
 | `GROK_GATEWAY_URL must use a loopback host` | Use `127.0.0.1`, `localhost`, or `::1` only |
-| Bot never replies | Both allowlists must include the numeric IDs; groups and channels are ignored |
+| Bot never replies | Both allowlists must include the numeric IDs for private chats; groups need their chat ID in `TELEGRAM_ALLOWED_CHAT_IDS`; channels are ignored |
+| Bot ignores ordinary group messages | Turn off BotFather privacy mode or make the bot an admin; check `TELEGRAM_ALLOWED_TOPIC_IDS`; plain acknowledgements and emoji are dropped by design |
+| Group replies are too chatty or too quiet | Tune `TELEGRAM_GROUP_KEYWORDS` and `TELEGRAM_GROUP_HINT`, or route the topic to a dedicated agent with `TELEGRAM_TOPIC_AGENTS` |
 | `discover-ids` prints nothing | Send `/start` first, then run it again |
 | Process dies after idle time | The Grok computer hibernated; use `ensure` from a routine |
 | Approval button does nothing useful | It may have expired (10 minutes), already been used, or the Grok request is no longer pending |
@@ -198,14 +254,15 @@ To uninstall: `stop`, delete the project directory (including `.env` and `bridge
 | Attachment rejected | Public Bot API limit is 20 MB in and out |
 | Reply says to open Grok Bot | The gateway returned a secret prompt, captcha, rich widget, or other desktop-only interaction |
 
-Logs are `bridge.log` next to the process. They include operational errors and omit Telegram message bodies and tokens. If `bridge-state.json` is malformed, the bridge renames it with a `.corrupt-<timestamp>` suffix and starts clean.
+Logs are `bridge.log` next to the process. They include operational errors and omit Telegram message bodies and tokens. In this fork they also include chat ids, topic ids, learned topic names, and the configured topic-to-agent map. If `bridge-state.json` is malformed, the bridge renames it with a `.corrupt-<timestamp>` suffix and starts clean.
 
 ## Limitations
 
 | Area | Limitation |
 | --- | --- |
 | Support | Unofficial. Grok Bot, its gateway, and Telegram can change without notice. |
-| Chats | Private chats only. No groups, channels, topics, or inline mode. |
+| Chats | Private chats, plus allowlisted groups and forum topics in this fork. No channels or inline mode. |
+| Group access | Group authorization is per chat, not per member: anyone in an allowlisted group can prompt the bot. |
 | Transport | No inbound ports, webhook, streaming tokens, or edit-as-it-types. |
 | Network | No Tailscale or laptop proxy is required or provided. |
 | Desktop-only UI | Chat Settings, General Settings, and Usage & Billing stay in the Grok desktop UI. |
@@ -216,4 +273,4 @@ Logs are `bridge.log` next to the process. They include operational errors and o
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). This fork keeps the original copyright notice of the grokbot-telegram-bridge contributors; fork changes are released under the same license.

@@ -14,11 +14,11 @@
   "description": "Unofficial self-hosted Telegram bridge for Grok Bot's local Sand gateway.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ssbrouhard/grokbot-telegram-bridge.git"
+    "url": "git+https://github.com/jeffrey94/grokbot-telegram-employee.git"
   },
-  "homepage": "https://github.com/ssbrouhard/grokbot-telegram-bridge#readme",
+  "homepage": "https://github.com/jeffrey94/grokbot-telegram-employee#readme",
   "bugs": {
-    "url": "https://github.com/ssbrouhard/grokbot-telegram-bridge/issues"
+    "url": "https://github.com/jeffrey94/grokbot-telegram-employee/issues"
   },
   "type": "module",
   "engines": {

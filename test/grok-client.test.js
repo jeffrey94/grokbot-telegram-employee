@@ -409,3 +409,62 @@ test("announces a pending approval once while continuing to wait", async () => {
   assert.deepEqual(announced, ["approval-entry"]);
   assert.equal(reply.text, "Done");
 });
+
+test("telegram-originated waits return the full turn despite an early busy lastMessageId", async () => {
+  let statusCalls = 0;
+  const entries = [
+    { id: "prompt", kind: "message", clientNonce: "telegram:1:99:1" },
+    { id: "ack", kind: "send-message", message: { type: "text", content: "On it" } },
+    { id: "final", kind: "send-message", message: { type: "text", content: "Done with PDF" } },
+    { id: "pdf", kind: "send-message", message: { type: "attachment", url: "/attachments/a.pdf", file_name: "a.pdf" } },
+  ];
+  const client = new GrokClient("http://127.0.0.1:4321", "gateway-token", {
+    pollIntervalMs: 1,
+    replyTimeoutMs: 200,
+    fetchImpl: async (url) => ({
+      ok: true,
+      json: async () => url.endsWith("/listAgents")
+        ? ({ agents: [{
+          id: "a1",
+          isRunning: ++statusCalls === 1,
+          lastMessageId: statusCalls === 1 ? "ack" : "pdf",
+        }] })
+        : ({ entries }),
+    }),
+  });
+
+  const reply = await client.waitForReply("a1", "telegram:1:99:1", { stableReplyMs: 0 });
+  assert.equal(reply.messageId, "pdf");
+  assert.equal(reply.text, "Done with PDF");
+  assert.equal(reply.entries.length, 3);
+  assert.deepEqual(reply.entries.map((entry) => entry.id), ["ack", "final", "pdf"]);
+});
+
+test("non-telegram waits still freeze ownership to the busy-era completion candidate", async () => {
+  let statusCalls = 0;
+  const entries = [
+    { id: "prompt", kind: "message", clientNonce: "wanted" },
+    { id: "reply", kind: "send-message", message: { type: "text", content: "Prompt reply" } },
+    { id: "scheduled", kind: "send-message", message: { type: "text", content: "Scheduled output" } },
+  ];
+  const client = new GrokClient("http://127.0.0.1:4321", "gateway-token", {
+    pollIntervalMs: 1,
+    replyTimeoutMs: 100,
+    fetchImpl: async (url) => ({
+      ok: true,
+      json: async () => url.endsWith("/listAgents")
+        ? ({ agents: [{
+          id: "a1",
+          isRunning: ++statusCalls === 1,
+          lastMessageId: statusCalls === 1 ? "reply" : "scheduled",
+        }] })
+        : ({ entries }),
+    }),
+  });
+
+  assert.deepEqual(await client.waitForReply("a1", "wanted"), {
+    messageId: "reply",
+    text: "Prompt reply",
+    attachments: [],
+  });
+});
